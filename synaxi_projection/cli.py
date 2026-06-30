@@ -12,7 +12,6 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_wrap = sub.add_parser("wrap", help="Wrap Claude Code with projection proxy")
-    p_wrap.add_argument("tool", choices=["claude"])
     p_wrap.add_argument(
         "--upstream",
         default="https://api.anthropic.com",
@@ -20,10 +19,11 @@ def main() -> None:
     )
     p_wrap.add_argument("--port", type=int, default=8787, help="Local proxy port (default: 8787)")
     p_wrap.add_argument("--no-proxy", action="store_true", help="Reuse already-running proxy")
-    p_wrap.add_argument("claude_args", nargs=argparse.REMAINDER, help="Extra args passed to claude")
+    # 'tool' and any extra claude args go in REMAINDER so --upstream can appear anywhere
+    p_wrap.add_argument("claude_args", nargs=argparse.REMAINDER, help="[claude] [extra claude args...]")
 
     p_unwrap = sub.add_parser("unwrap", help="Remove proxy config and restore settings")
-    p_unwrap.add_argument("tool", choices=["claude"])
+    p_unwrap.add_argument("tool_args", nargs=argparse.REMAINDER)
 
     sub.add_parser("status", help="Show wrapper/proxy status")
     sub.add_parser("doctor", help="Run health checks")
@@ -31,8 +31,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "wrap":
-        # Filter out leading '--' that argparse REMAINDER sometimes includes
-        extra = [a for a in (args.claude_args or []) if a != "--"]
+        # Strip leading 'claude' positional and any stray '--'
+        extra = [a for a in (args.claude_args or []) if a not in ("--", "claude")]
         wrap_claude(
             upstream=args.upstream,
             port=args.port,
