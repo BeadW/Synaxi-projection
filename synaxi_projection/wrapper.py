@@ -1,17 +1,31 @@
+"""
+synaxi_projection.wrapper
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Wrap Claude Code with the Synaxi projection proxy — Headroom-style.
+
+How it works (same as Headroom):
+  1. Start a local proxy on http://127.0.0.1:\<port\>
+  2. Write ANTHROPIC_BASE_URL into .claude/settings.local.json so ALL
+     Claude Code sessions (including daemon-spawned workers) route through it.
+  3. Launch `claude` as a subprocess with the env var also set directly.
+  4. On exit: restore settings.local.json and stop the proxy.
+
+Point at Ollama: pass upstream="http://127.0.0.1:11434"
+"""
 from __future__ import annotations
 
 import json
 import os
 import shutil
-import stat
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
 
-STATE_DIR = Path.home() / '.synaxi-projection'
-STATE_FILE = STATE_DIR / 'state.json'
-BACKUP_DIR = STATE_DIR / 'backups'
-USER_BIN = Path.home() / '.local' / 'bin'
+from synaxi_projection.proxy import DEFAULT_PORT, is_proxy_running, start_proxy, stop_proxy
+
+STATE_DIR = Path.home() / ".synaxi-projection"
+STATE_FILE = STATE_DIR / "state.json"
 
 
 def _load_state() -> dict:
@@ -28,146 +42,145 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def _find_real_binary(name: str) -> Optional[str]:
-    """Find the real binary, skipping any existing entry at USER_BIN (shim location)."""
-    shim_location = USER_BIN / name
-    shim_resolved = str(shim_location.resolve()) if shim_location.exists() else None
-    for part in os.environ.get('PATH', '').split(':'):
-        if not part:
-            continue
-        cand = Path(part) / name
-        if not cand.exists() or not os.access(cand, os.X_OK):
-            continue
-        # Skip anything that resolves to the same file as the shim location
+def _write_base_url(proxy_url: str, settings_path: Path) -> Optional[str]:
+    """Inject ANTHROPIC_BASE_URL into a Claude settings file. Returns previous value."""
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict = {}
+    if settings_path.exists():
         try:
-            resolved = str(cand.resolve())
+            payload = json.loads(settings_path.read_text())
         except Exception:
-            resolved = str(cand)
-        if shim_resolved and resolved == shim_resolved:
-            continue
-        if str(cand.resolve()) == str(shim_location.resolve()) if shim_location.exists() else False:
-            continue
-        return resolved
-    return None
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    previous = env_map.get("ANTHROPIC_BASE_URL")
+    env_map["ANTHROPIC_BASE_URL"] = proxy_url
+    env_map.setdefault("ENABLE_TOOL_SEARCH", "true")  # keep deferred tool schemas (Headroom #746)
+    payload["env"] = env_map
+    settings_path.write_text(json.dumps(payload, indent=2) + "\n")
+    return previous
 
 
-def wrap_claude(proxy_url: Optional[str] = None) -> dict:
-    tool = 'claude'
-    shim_path = USER_BIN / tool
-
-    # Determine real binary path and how to restore on unwrap
-    restore_type: str = 'none'
-    restore_data: Optional[str] = None
-    real_binary: Optional[str] = None
-
-    if shim_path.is_symlink():
-        # Symlink (e.g. Claude Code installs as ~/.local/bin/claude -> real executable)
-        # Resolve to the actual binary and store the symlink target for restore
-        restore_type = 'symlink'
-        restore_data = str(os.readlink(shim_path))          # original link target
-        real_binary = str(shim_path.resolve())              # actual executable on disk
-        shim_path.unlink()                                  # remove symlink before writing shim
-    elif shim_path.exists():
-        # Regular file — back it up
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        backup_path = BACKUP_DIR / f'{tool}.{int(time.time())}.bak'
-        shutil.move(str(shim_path), str(backup_path))
-        restore_type = 'backup'
-        restore_data = str(backup_path)
-        real_binary = str(backup_path)                      # binary is now at backup location
+def _restore_base_url(previous: Optional[str], settings_path: Path) -> None:
+    if not settings_path.exists():
+        return
+    try:
+        payload = json.loads(settings_path.read_text())
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    env_map = payload.get("env")
+    if not isinstance(env_map, dict):
+        return
+    if previous is None:
+        env_map.pop("ANTHROPIC_BASE_URL", None)
+        env_map.pop("ENABLE_TOOL_SEARCH", None)
     else:
-        # Nothing at shim location — find real binary elsewhere in PATH
-        real_binary = _find_real_binary(tool) or shutil.which(tool)
-        if not real_binary:
-            raise RuntimeError('Could not find `claude` in PATH. Install Claude Code first.')
-        restore_type = 'none'
+        env_map["ANTHROPIC_BASE_URL"] = previous
+    if env_map:
+        payload["env"] = env_map
+    else:
+        payload.pop("env", None)
+    if payload:
+        settings_path.write_text(json.dumps(payload, indent=2) + "\n")
+    else:
+        settings_path.unlink(missing_ok=True)
 
-    if not real_binary:
-        raise RuntimeError('Could not determine real claude binary path.')
 
-    USER_BIN.mkdir(parents=True, exist_ok=True)
-    shim_script = "#!/usr/bin/env bash\nexec /usr/bin/env python3 -m synaxi_projection.shim \"$@\"\n"
-    shim_path.write_text(shim_script)
-    shim_path.chmod(shim_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+def wrap_claude(
+    upstream: str = "https://api.anthropic.com",
+    port: int = DEFAULT_PORT,
+    proxy_url: Optional[str] = None,
+    claude_args: tuple = (),
+    no_proxy: bool = False,
+) -> dict:
+    """
+    Start proxy, write settings.local.json, launch claude, restore on exit.
+    Raises SystemExit with claude's return code.
+    """
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise RuntimeError("'claude' not found in PATH. Install Claude Code first.")
 
-    state = {
-        'tool': tool,
-        'wrapped': True,
-        'real_binary': real_binary,
-        'shim_path': str(shim_path),
-        'restore_type': restore_type,   # 'symlink' | 'backup' | 'none'
-        'restore_data': restore_data,   # symlink target or backup path
-        # legacy keys kept for compat
-        'backup_path': restore_data if restore_type == 'backup' else None,
-        'proxy_url': proxy_url,
-        'wrapped_at': int(time.time()),
-        'mode': 'projection-only',
-    }
-    _save_state(state)
-    return state
+    effective_proxy_url = proxy_url or f"http://127.0.0.1:{port}"
+
+    proxy_proc = None
+    if no_proxy:
+        if not is_proxy_running(port):
+            raise RuntimeError(f"--no-proxy: no proxy running on port {port}")
+    else:
+        proxy_proc = start_proxy(port=port, upstream=upstream)
+
+    settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    saved_base_url = _write_base_url(effective_proxy_url, settings_path)
+
+    _save_state({
+        "wrapped": True,
+        "proxy_url": effective_proxy_url,
+        "upstream": upstream,
+        "port": port,
+        "settings_path": str(settings_path),
+        "saved_base_url": saved_base_url,
+        "wrapped_at": int(time.time()),
+    })
+
+    env = os.environ.copy()
+    env["ANTHROPIC_BASE_URL"] = effective_proxy_url
+    env["ENABLE_TOOL_SEARCH"] = "true"
+
+    try:
+        result = subprocess.run([claude_bin, *claude_args], env=env)
+        exit_code = result.returncode
+    except KeyboardInterrupt:
+        exit_code = 130
+    finally:
+        _restore_base_url(saved_base_url, settings_path)
+        stop_proxy(proxy_proc)
+        _save_state({"wrapped": False, "unwrapped_at": int(time.time())})
+
+    raise SystemExit(exit_code)
 
 
 def unwrap_claude() -> dict:
-    state = _load_state()
-    tool = state.get('tool', 'claude')
-    shim_path = Path(state.get('shim_path', str(USER_BIN / tool)))
-
-    if shim_path.exists() or shim_path.is_symlink():
-        try:
-            shim_path.unlink()
-        except Exception:
-            pass
-
-    restore_type = state.get('restore_type', 'backup' if state.get('backup_path') else 'none')
-    restore_data = state.get('restore_data') or state.get('backup_path')
-    restored = False
-
-    if restore_type == 'symlink' and restore_data:
-        # Recreate the original symlink
-        USER_BIN.mkdir(parents=True, exist_ok=True)
-        os.symlink(restore_data, str(shim_path))
-        restored = True
-    elif restore_type == 'backup' and restore_data and Path(restore_data).exists():
-        USER_BIN.mkdir(parents=True, exist_ok=True)
-        shutil.move(restore_data, str(shim_path))
-        restored = True
-
-    _save_state({
-        'tool': tool,
-        'wrapped': False,
-        'restored_backup': restored,
-        'unwrapped_at': int(time.time()),
-    })
-    return {'restored': restored, 'restore_type': restore_type, 'tool': tool}
+    """Cleanup: remove ANTHROPIC_BASE_URL from settings.local.json."""
+    st = _load_state()
+    settings_path = Path(st.get("settings_path", str(Path.cwd() / ".claude" / "settings.local.json")))
+    _restore_base_url(st.get("saved_base_url"), settings_path)
+    _save_state({"wrapped": False, "unwrapped_at": int(time.time())})
+    return {"restored": True, "settings_path": str(settings_path)}
 
 
 def status() -> dict:
     st = _load_state()
-    active = bool(st.get('wrapped'))
-    which = shutil.which('claude')
+    port = st.get("port", DEFAULT_PORT)
     return {
-        'wrapped': active,
-        'state_file': str(STATE_FILE),
-        'which_claude': which,
-        'real_binary': st.get('real_binary'),
-        'shim_path': st.get('shim_path'),
-        'mode': st.get('mode'),
-        'proxy_url': st.get('proxy_url'),
+        "wrapped": bool(st.get("wrapped")),
+        "proxy_running": is_proxy_running(port),
+        "proxy_url": st.get("proxy_url"),
+        "upstream": st.get("upstream"),
+        "which_claude": shutil.which("claude"),
+        "settings_path": st.get("settings_path"),
+        "state_file": str(STATE_FILE),
     }
 
 
 def doctor() -> dict:
     st = status()
     checks = {
-        'claude_in_path': bool(st.get('which_claude')),
-        'state_file_exists': STATE_FILE.exists(),
-        'shim_exists': Path(st['shim_path']).exists() if st.get('shim_path') else False,
-        'real_binary_exists': Path(st['real_binary']).exists() if st.get('real_binary') else False,
-        'user_bin_on_path': str(USER_BIN) in os.environ.get('PATH', '').split(':'),
+        "claude_in_path": bool(st.get("which_claude")),
+        "proxy_running": st["proxy_running"],
+        "state_file_exists": STATE_FILE.exists(),
     }
-    # Only require wrapped-state checks when actually wrapped
-    ok = all(
-        v for k, v in checks.items()
-        if k not in ('state_file_exists', 'shim_exists', 'real_binary_exists') or st.get('wrapped')
-    )
-    return {'ok': ok, 'checks': checks, 'status': st}
+    sp = st.get("settings_path")
+    if sp:
+        try:
+            payload = json.loads(Path(sp).read_text())
+            checks["base_url_set"] = (
+                payload.get("env", {}).get("ANTHROPIC_BASE_URL") == st.get("proxy_url")
+            )
+        except Exception:
+            checks["base_url_set"] = False
+    ok = checks["claude_in_path"]
+    return {"ok": ok, "checks": checks, "status": st}
