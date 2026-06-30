@@ -1,0 +1,238 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+* { box-sizing: border-box; }
+body { margin:0; font-family: monospace; font-size: 13px; background:#1e1e1e; color:#d4d4d4; }
+.c { display:flex; height:100vh; }
+.p { flex:1; overflow-y:scroll; padding:20px; border-right:1px solid #444; min-width:0; }
+h1 { color:#569cd6; border-bottom:1px solid #444; margin:0 0 16px; font-size:16px; }
+h2 { color:#4ec9b0; margin:24px 0 8px; font-size:14px; }
+p { margin:4px 0; line-height:1.5; word-wrap:break-word; overflow-wrap:break-word; }
+pre { background:#2d2d2d; padding:10px; white-space:pre-wrap; overflow-wrap:break-word;
+       word-break:break-word; margin:6px 0; border-radius:4px; font-size:12px; }
+blockquote { border-left:3px solid #9cdcfe; margin:4px 0; padding-left:12px; color:#9cdcfe; }
+hr { border-color:#444; margin:16px 0; }
+</style>
+</head><body><div class="c">
+<div class="p"><h1>BASELINE — t3_async_pipeline_bug</h1>
+<p>Model: haiku  Task: making all pytest tests pass</p>
+<br>
+<hr>
+<h2>Turn 1</h2>
+<p>**Context size:** 102 chars  (1 messages)</p>
+<br>
+<p>**Model text:**</p>
+<p>I&#x27;ll help you make all pytest tests pass. Let me start by exploring the sandbox directory to see what we&#x27;re working with.</p>
+<br>
+<p>**Tool:** `run_command({&quot;command&quot;: &quot;find . -type f -name \&quot;*.py\&quot; | head -20&quot;})`</p>
+<br>
+<p>**Result:** `exit=0</p>
+<p>./pipeline.py</p>
+<p>./test_pipeline.py</p>
+<p>`</p>
+<br>
+<h2>Turn 2</h2>
+<p>**Context size:** 633 chars  (3 messages)</p>
+<br>
+<p>**Model text:**</p>
+<p>Let me check the test file to see what tests need to pass:</p>
+<br>
+<p>**Tool:** `read_file({&quot;path&quot;: &quot;./test_pipeline.py&quot;})`</p>
+<br>
+<p>**Result:** `import asyncio</p>
+<p>import pytest</p>
+<p>from pipeline import AsyncPipeline</p>
+<br>
+<p>@pytest.mark.asyncio</p>
+<p>async def test_basic_pipeline():</p>
+<p>    p = AsyncPipeline()</p>
+<p>    p.add_stage(lambda x: x * 2)</p>
+<p>    p.add_stage(lambda x`</p>
+<br>
+<p>**Tool:** `read_file({&quot;path&quot;: &quot;./pipeline.py&quot;})`</p>
+<br>
+<p>**Result:** `import asyncio</p>
+<p>from typing import List, Callable, Any</p>
+<br>
+<p>class AsyncPipeline:</p>
+<p>    def __init__(self):</p>
+<p>        self.stages: List[Callable] = []</p>
+<br>
+<p>    def add_stage(self, fn: Callable) -&gt; &quot;AsyncPipeline&quot;:</p>
+<p>`</p>
+<br>
+<h2>Turn 3</h2>
+<p>**Context size:** 2978 chars  (5 messages)</p>
+<br>
+<p>**Model text:**</p>
+<p>Now let me run the tests to see what&#x27;s failing:</p>
+<br>
+<p>**Tool:** `run_command({&quot;command&quot;: &quot;cd /sandbox &amp;&amp; pytest test_pipeline.py -v&quot;})`</p>
+<br>
+<p>**Result:** `exit=1</p>
+<p>/bin/sh: line 0: cd: /sandbox: No such file or directory</p>
+<p>`</p>
+<br>
+<h2>Turn 4</h2>
+<p>**Context size:** 3459 chars  (7 messages)</p>
+<br>
+<p>**Tool:** `run_command({&quot;command&quot;: &quot;pwd &amp;&amp; pytest test_pipeline.py -v&quot;})`</p>
+<br>
+<p>**Result:** `exit=1</p>
+<p>/private/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_1g2lqimi</p>
+<p>============================= test session starts ==============================</p>
+<p>platform darwin -- Python 3.9.6, p`</p>
+<br>
+<h2>Turn 5</h2>
+<p>**Context size:** 5839 chars  (9 messages)</p>
+<br>
+<p>**Model text:**</p>
+<p>I can see the issue! In the `_process` method, when we have an async function, we&#x27;re calling it but not awaiting it. Let me fix the `pipeline.py` file:</p>
+<br>
+<p>**Tool:** `write_file({&quot;path&quot;: &quot;./pipeline.py&quot;, &quot;content&quot;: &quot;import asyncio\nfrom typing import List, C)`</p>
+<br>
+<p>**Result:** `Written 953 bytes to ./pipeline.py`</p>
+<br>
+<h2>Turn 6</h2>
+<p>**Context size:** 7362 chars  (11 messages)</p>
+<br>
+<p>**Model text:**</p>
+<p>Now let&#x27;s run the tests again to verify they all pass:</p>
+<br>
+<p>**Tool:** `run_command({&quot;command&quot;: &quot;pytest test_pipeline.py -v&quot;})`</p>
+<br>
+<p>**Result:** `exit=0</p>
+<p>============================= test session starts ==============================</p>
+<p>platform darwin -- Python 3.9.6, pytest-7.4.4, pluggy-1.6.0 -- /Applications/Xcode.app/Contents/Developer/usr/bi`</p>
+<br>
+<h2>Turn 7</h2>
+<p>**Context size:** 8532 chars  (13 messages)</p>
+<br>
+<p>**Model text:**</p>
+<p>Perfect! ✅ All pytest tests are now passing! </p>
+<br>
+<h2>Summary</h2>
+<br>
+<p>The issue was in the `_process` method of the `AsyncPipeline` class. When a stage function was asynchronous (detected via `asyncio.iscoroutinefunction()`), the code was calling the function but not **awaiting** it.</p>
+<br>
+<p>**The fix:** Changed line from:</p>
+<pre>
+value = stage(value)
+
+</pre>
+<p>to:</p>
+<pre>
+value = await stage(value)
+
+</pre>
+<br>
+<p>This ensures that asynchronous functions are properly awaited, returning their actual results rather than unawaited coroutine objects. Now all three tests pass:</p>
+<p>- ✅ `test_basic_pipeline` - Tests synchronous pipeline stages</p>
+<p>- ✅ `test_async_stages` - Tests asynchronous pipeline stages with parallel execution</p>
+<p>- ✅ `test_empty_input` - Tests handling of empty input lists</p>
+<br>
+<br>
+<hr>
+<h2>Result: PASS ✅</h2>
+<br>
+<pre>
+...                                                                      [100%]
+
+3 passed in 0.00s
+
+
+
+</pre>
+<br>
+<p>Input tokens: 12899  Output: 1006  Tools: 7</p>
+<br></div>
+<div class="p"><h1>PROJECTION — t3_async_pipeline_bug</h1>
+<p>Model: haiku  Task: making all pytest tests pass</p>
+<br>
+<hr>
+<h2>Turn 1</h2>
+<p>**Context (1 messages)**</p>
+<br>
+<p>**Model text:**</p>
+<p>I&#x27;ll start by exploring the working directory to see what we&#x27;re working with.</p>
+<br>
+<p>**Tool:** `run_command({&quot;command&quot;: &quot;find /var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_c)`</p>
+<br>
+<p>**Result:** `exit=0</p>
+<p>/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p/pipeline.py</p>
+<p>/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p/test_pipeline.py</p>
+<p>`</p>
+<br>
+<h2>Turn 2</h2>
+<p>**Context (5 messages)**</p>
+<br>
+<pre>
+[assistant] tool_use: run_command({&quot;command&quot;: &quot;find /var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p -type f -name \&quot;*.py\&quot; | head -2)
+
+</pre>
+<br>
+<pre>
+[user] tool_result: exit=0
+
+/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p/pipeline.py
+
+/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p/test_pipeline.py
+
+
+
+</pre>
+<br>
+<pre>
+[assistant] tool_use: run_command({&quot;command&quot;: &quot;find /var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p -type f -name \&quot;*.py\&quot; | head -2)
+
+</pre>
+<br>
+<pre>
+[user] tool_result: exit=0
+
+/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p/pipeline.py
+
+/var/folders/0t/72yqwvrd5xz3bvh3pb75l8hr0000gn/T/synaxi_task_ce_ab12p/test_pipeline.py
+
+
+
+</pre>
+<br>
+<p>**API ERROR**: {&#x27;code&#x27;: 429, &#x27;message&#x27;: &#x27;{&quot;type&quot;:&quot;error&quot;,&quot;error&quot;:{&quot;type&quot;:&quot;rate_limit_error&quot;,&quot;message&quot;:&quot;This request would exceed your account\&#x27;s rate limit. Please try again later.&quot;},&quot;request_id&quot;:&quot;req_011CcPjEeR5JsgaryuFTVXXF&quot;}&#x27;}</p>
+<br>
+<hr>
+<h2>Result: FAIL ❌</h2>
+<br>
+<pre>
+.F
+
+=================================== FAILURES ===================================
+
+______________________________ test_async_stages _______________________________
+
+test_pipeline.py:22: in test_async_stages
+
+    assert result == [2, 4, 6]
+
+E   assert [&lt;coroutine o... 0x10649cd40&gt;] == [2, 4, 6]
+
+E     At index 0 diff: &lt;coroutine object test_async_stages.&lt;locals&gt;.double at 0x10649cc40&gt; != 2
+
+E     Use -v to get more diff
+
+=========================== short test summary info ============================
+
+FAILED test_pipeline.py::test_async_stages - assert [&lt;coroutine o... 0x10649c...
+
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+1 failed, 1 passed in 0.01s
+
+sys:1: RuntimeWarning: coroutine &#x27;test_async_stages.&lt;locals&gt;.double&#x27; was never awaited
+
+
+
+</pre>
+<br>
+<p>Input tokens: 1029  Output: 128  Tools: 1</p>
+<br></div>
+</div></body></html>
