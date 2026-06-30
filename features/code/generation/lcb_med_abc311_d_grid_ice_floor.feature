@@ -1,0 +1,128 @@
+Feature: LiveCodeBench/atcoder/medium — Grid Ice Floor
+  Complexity: T2
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      There is an N \times M grid and a player standing on it.
+      Let (i,j) denote the square at the i-th row from the top and j-th column from the left of this grid.
+      Each square of this grid is ice or rock, which is represented by N strings S_1,S_2,\dots,S_N of length M as follows:
+
+      - if the j-th character of S_i is ., square (i,j) is ice;
+      - if the j-th character of S_i is #, square (i,j) is rock.
+
+      The outer periphery of this grid (all squares in the 1-st row, N-th row, 1-st column, M-th column) is rock.
+      Initially, the player rests on the square (2,2), which is ice.
+      The player can make the following move zero or more times.
+
+      - First, specify the direction of movement: up, down, left, or right.
+      - Then, keep moving in that direction until the player bumps against a rock. Formally, keep doing the following:
+      - if the next square in the direction of movement is ice, go to that square and keep moving;
+      - if the next square in the direction of movement is rock, stay in the current square and stop moving.
+
+
+
+      Find the number of ice squares the player can touch (pass or rest on).
+
+      Input
+
+      The input is given from Standard Input in the following format:
+      N M
+      S_1
+      S_2
+      \vdots
+      S_N
+
+      Output
+
+      Print the answer as an integer.
+
+      Constraints
+
+
+      - 3 \le N,M \le 200
+      - S_i is a string of length M consisting of # and ..
+      - Square (i, j) is rock if i=1, i=N, j=1, or j=M.
+      - Square (2,2) is ice.
+
+      Sample Input 1
+
+      6 6
+      ######
+      #....#
+      #.#..#
+      #..#.#
+      #....#
+      ######
+
+      Sample Output 1
+
+      12
+
+      For instance, the player can rest on (5,5) by moving as follows:
+
+      - (2,2) \rightarrow (5,2) \rightarrow (5,5).
+
+      The player can pass (2,4) by moving as follows:
+
+      - (2,2) \rightarrow (2,5), passing (2,4) in the process.
+
+      The player cannot pass or rest on (3,4).
+
+      Sample Input 2
+
+      21 25
+      #########################
+      #..............###...####
+      #..............#..#...###
+      #........###...#...#...##
+      #........#..#..#........#
+      #...##...#..#..#...#....#
+      #..#..#..###...#..#.....#
+      #..#..#..#..#..###......#
+      #..####..#..#...........#
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write answer to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+
+      TEST_CASES = [
+          [
+              "6 6\n######\n#....#\n#.#..#\n#..#.#\n#....#\n######\n",
+              "12\n"
+          ],
+          [
+              "21 25\n#########################\n#..............###...####\n#..............#..#...###\n#........###...#...#...##\n#........#..#..#........#\n#...##...#..#..#...#....#\n#..#..#..###...#..#.....#\n#..#..#..#..#..###......#\n#..####..#..#...........#\n#..#..#..###............#\n#..#..#.................#\n#........##.............#\n#.......#..#............#\n#..........#....#.......#\n#........###...##....#..#\n#..........#..#.#...##..#\n#.......#..#....#..#.#..#\n##.......##.....#....#..#\n###.............#....#..#\n####.................#..#\n#########################\n",
+              "215\n"
+          ]
+      ]
+
+
+      def test_lcb():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == str(expected).strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the LiveCodeBench problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py to read from stdin and write the correct answer to stdout so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

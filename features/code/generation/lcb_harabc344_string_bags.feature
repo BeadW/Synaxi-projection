@@ -1,0 +1,137 @@
+Feature: LiveCodeBench/atcoder/hard — String Bags
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      You initially have an empty string S.
+      Additionally, there are bags 1, 2, \dots, N, each containing some strings.
+      Bag i contains A_i strings S_{i,1}, S_{i,2}, \dots, S_{i,A_i}.
+      You will repeat the following steps for i = 1, 2, \dots, N:
+
+      - Choose and perform one of the following two actions:
+      - Pay 1 yen, select exactly one string from bag i, and concatenate it to the end of S.
+      - Do nothing.
+
+
+
+      Given a string T, find the minimum amount of money required to make the final S equal T.
+      If there is no way to make the final S equal T, print -1.
+
+      Input
+
+      The input is given from Standard Input in the following format:
+      T
+      N
+      A_1 S_{1,1} S_{1,2} \dots S_{1,A_1}
+      A_2 S_{2,1} S_{2,2} \dots S_{2,A_2}
+      \vdots
+      A_N S_{N,1} S_{N,2} \dots S_{N,A_N}
+
+      Output
+
+      Print the answer as an integer.
+
+      Constraints
+
+
+      - T is a string consisting of lowercase English letters with length between 1 and 100, inclusive.
+      - N is an integer between 1 and 100, inclusive.
+      - A_i is an integer between 1 and 10, inclusive.
+      - S_{i,j} is a string consisting of lowercase English letters with length between 1 and 10, inclusive.
+
+      Sample Input 1
+
+      abcde
+      3
+      3 ab abc abcd
+      4 f c cd bcde
+      2 e de
+
+      Sample Output 1
+
+      2
+
+      For example, doing the following makes the final S equal T with two yen, which can be shown to be the minimum amount required.
+
+      - For i=1, select abc from bag 1 and concatenate it to the end of S, making S= abc.
+      - For i=2, do nothing.
+      - For i=3, select de from bag 3 and concatenate it to the end of S, making S= abcde.
+
+      Sample Input 2
+
+      abcde
+      3
+      2 ab abc
+      3 f c bcde
+      1 e
+
+      Sample Output 2
+
+      -1
+
+      There is no way to make the final S equal T, so print -1.
+
+      Sample Input 3
+
+      aaabbbbcccc
+      6
+      2 aa aaa
+      2 dd ddd
+      2 ab aabb
+      4 bbaa bbbc bbb bbcc
+      2 cc bcc
+      3 ccc cccc ccccc
+
+      Sample Output 3
+
+      4
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+
+      TEST_CASES = [
+          [
+              "abcde\n3\n3 ab abc abcd\n4 f c cd bcde\n2 e de\n",
+              "2\n"
+          ],
+          [
+              "abcde\n3\n2 ab abc\n3 f c bcde\n1 e\n",
+              "-1\n"
+          ],
+          [
+              "aaabbbbcccc\n6\n2 aa aaa\n2 dd ddd\n2 ab aabb\n4 bbaa bbbc bbb bbcc\n2 cc bcc\n3 ccc cccc ccccc\n",
+              "4\n"
+          ]
+      ]
+
+
+      def test_lcb():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == expected.strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the LiveCodeBench problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

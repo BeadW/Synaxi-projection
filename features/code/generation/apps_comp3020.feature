@@ -1,0 +1,93 @@
+Feature: APPS/competition/3020 — competitive programming problem
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      “Drat!” cursed Charles. “This stupid carry bar is not working in my Engine! I just tried to calculate the square of a number, but it’s wrong; all of the carries are lost.”
+
+      “Hmm,” mused Ada, “arithmetic without carries! I wonder if I can figure out what your original input was, based on the result I see on the Engine.”
+
+      Carryless addition, denoted by $\oplus $, is the same as normal addition, except any carries are ignored (in base $10$). Thus, $37 \oplus 48$ is $75$, not $85$.
+
+      Carryless multiplication, denoted by $\otimes $, is performed using the schoolboy algorithm for multiplication, column by column, but the intermediate additions are calculated using carryless addition. More formally, Let $a_ m a_{m-1} \ldots a_1 a_0$ be the digits of $a$, where $a_0$ is its least significant digit. Similarly define $b_ n b_{n-1} \ldots b_1 b_0$ be the digits of $b$. The digits of $c = a \otimes b$ are given by the following equation:\[ c_ k = \left( a_0 b_ k \oplus a_1 b_{k-1} \oplus \cdots \oplus a_{k-1} b_1 \oplus a_ k b_0 \right) \bmod {10}, \]
+
+      where any $a_ i$ or $b_ j$ is considered zero if $i > m$ or $j > n$. For example, $9 \otimes 1234$ is $9876$, $90 \otimes 1234$ is $98760$, and $99 \otimes 1234$ is $97536$.
+
+      Given $N$, find the smallest positive integer $a$ such that $a \otimes a = N$.
+
+      -----Input-----
+      The input consists of a single line with a positive integer $N$, with at most $25$ digits and no leading zeros.
+
+      -----Output-----
+      Print, on a single line, the least positive number $a$ such that $a \otimes a = N$. If there is no such $a$, print ‘-1’ instead.
+
+      -----Examples-----
+      Sample Input 1:
+      6
+      Sample Output 1:
+      4
+
+      Sample Input 2:
+      149
+      Sample Output 2:
+      17
+
+      Sample Input 3:
+      123476544
+      Sample Output 3:
+      11112
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write answer to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+      import pytest
+
+      TEST_CASES = [
+          [
+              "6\n",
+              "4\n"
+          ],
+          [
+              "149\n",
+              "17\n"
+          ],
+          [
+              "123476544\n",
+              "11112\n"
+          ],
+          [
+              "15\n",
+              "-1\n"
+          ]
+      ]
+
+
+      def test_apps():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == str(expected).strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the APPS problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py to read from stdin and write the correct answer to stdout so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

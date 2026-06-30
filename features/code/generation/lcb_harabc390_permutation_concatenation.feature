@@ -1,0 +1,111 @@
+Feature: LiveCodeBench/atcoder/hard — Permutation Concatenation
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      You are given a positive integer N.
+      For an integer sequence A=(A_1,A_2,\ldots,A_N) of length N. Let f(A) be the integer obtained as follows:
+
+      - Let S be an empty string.
+      - For i=1,2,\ldots,N in this order:
+      - Let T be the decimal representation of A_i without leading zeros.
+      - Append T to the end of S.
+
+
+      - Interpret S as a decimal integer, and let that be f(A).
+
+      For example, if A=(1,20,34), then f(A)=12034.
+      There are N! permutations P of (1,2,\ldots,N). Find the sum, modulo 998244353, of f(P) over all such permutations P.
+
+      Input
+
+      The input is given from Standard Input in the following format:
+      N
+
+      Output
+
+      Print the sum, modulo 998244353, of f(P) over all permutations P of (1,2,\ldots,N).
+
+      Constraints
+
+
+      - 1 \le N \le 2 \times 10^5
+      - All input values are integers.
+
+      Sample Input 1
+
+      3
+
+      Sample Output 1
+
+      1332
+
+      The six permutations of (1,2,3) are (1,2,3), (1,3,2), (2,1,3), (2,3,1), (3,1,2), (3,2,1). Their f(P) values are 123,132,213,231,312,321. Therefore, print 123+132+213+231+312+321 = 1332.
+
+      Sample Input 2
+
+      390
+
+      Sample Output 2
+
+      727611652
+
+      Print the sum modulo 998244353.
+
+      Sample Input 3
+
+      79223
+
+      Sample Output 3
+
+      184895744
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+
+      TEST_CASES = [
+          [
+              "3",
+              "1332"
+          ],
+          [
+              "390",
+              "727611652"
+          ],
+          [
+              "79223",
+              "184895744"
+          ]
+      ]
+
+
+      def test_lcb():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == expected.strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the LiveCodeBench problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

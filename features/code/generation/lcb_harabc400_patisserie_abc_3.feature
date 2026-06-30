@@ -1,0 +1,118 @@
+Feature: LiveCodeBench/atcoder/hard — Patisserie ABC 3
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      Takahashi, a patissier working at the ABC pastry shop, decided to sell assorted cakes to commemorate AtCoder Beginner Contest 400.
+      The shop sells N kinds of cakes: cake 1, cake 2, \ldots, cake N.
+      Each cake has three non-negative integer values: beauty, tastiness, and popularity. Specifically, cake i has beauty X_i, tastiness Y_i, and popularity Z_i.
+      He considers pairing up these cakes into K pairs without overlaps.
+      Formally, he will choose 2K distinct integers a_1,b_1,a_2,b_2,\ldots,a_K,b_K between 1 and N (inclusive), and pair cake a_i with cake b_i.
+      The price of a pair formed by cakes a_i and b_i is \max(X_{a_i} + X_{b_i},\, Y_{a_i} + Y_{b_i},\, Z_{a_i} + Z_{b_i}).
+      Here, \max(P,Q,R) denotes the greatest value among P,Q,R.
+      Find the maximum possible total price of the K pairs.
+      You are given T test cases; solve each of them.
+
+      Input
+
+      The input is given from Standard Input in the following format:
+      T
+      \mathrm{case}_1
+      \mathrm{case}_2
+      \vdots
+      \mathrm{case}_T
+
+      \mathrm{case}_i represents the i-th test case. Each test case is given in the following format:
+      N K
+      X_1 Y_1 Z_1
+      X_2 Y_2 Z_2
+      \vdots
+      X_N Y_N Z_N
+
+      Output
+
+      Print T lines. The i-th line (1\leq i\leq T) should contain the answer to the i-th test case.
+
+      Constraints
+
+
+      - 1\leq T\leq 1000
+      - 2\leq N \leq 10^5
+      - The sum of N over all test cases in each input file is at most 10^5.
+      - 1\leq K \leq \lfloor \frac{N}{2}\rfloor (For a real number x, \lfloor x\rfloor denotes the greatest integer not exceeding x.)
+      - 0\leq X_i,Y_i,Z_i \leq 10^9
+      - All input values are integers.
+
+      Sample Input 1
+
+      1
+      3 1
+      6 3 8
+      3 5 0
+      2 7 3
+
+      Sample Output 1
+
+      12
+
+      We form one pair out of three cakes.
+      If we pair cake 1 with cake 2, the price is \max(6+3,\,3+5,\,8+0) = 9.
+      If we pair cake 1 with cake 3, the price is \max(6+2,\,3+7,\,8+3) = 11.
+      If we pair cake 2 with cake 3, the price is \max(3+2,\,5+7,\,0+3) = 12.
+      Hence, pairing cake 2 with cake 3 gives the highest price, which is 12.
+
+      Sample Input 2
+
+      2
+      5 2
+      1 2 3
+      1 2 3
+      1 2 3
+      1 2 3
+      100 100 200
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+
+      TEST_CASES = [
+          [
+              "1\n3 1\n6 3 8\n3 5 0\n2 7 3",
+              "12"
+          ],
+          [
+              "2\n5 2\n1 2 3\n1 2 3\n1 2 3\n1 2 3\n100 100 200\n6 2\n21 74 25\n44 71 80\n46 28 96\n1 74 24\n81 83 16\n55 31 1",
+              "209\n333"
+          ]
+      ]
+
+
+      def test_lcb():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == expected.strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the LiveCodeBench problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

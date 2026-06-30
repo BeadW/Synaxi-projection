@@ -1,0 +1,90 @@
+Feature: APPS/competition/3042 — competitive programming problem
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      An LCM tree is a binary tree in which each node has a positive integer value, and either zero or two children. If two nodes $x$ and $y$ are the children of node $z$, then the Least Common Multiple (LCM) of the values of node $x$ and node $y$ must equal the value of node $z$. 
+
+      You are given $n$ nodes with positive integer values to be arranged into an LCM tree. In how many ways (modulo $10^9 + 7$) can you do that? Two ways are considered different if there are two nodes $x$ and $y$ so that $x$ is a child of $y$ in one way but not in the other way.
+
+      The illustration shows one of the two ways for the first sample case. The other way can be obtained by swapping the two nodes with value $4$. Note that swapping the two leaves with values $2$ and $4$ does not give a different way.
+
+      -----Input-----
+      The first line has an odd integer $n$ ($1 \leq n \leq 25$). The second line has $n$ positive integers no larger than $10^9$, giving the values of the nodes.
+
+      -----Output-----
+      Output the number of ways to arrange the given nodes into an LCM tree, modulo $10^9 + 7$.
+
+      -----Examples-----
+      Sample Input 1:
+      7
+      2 3 4 4 8 12 24
+      Sample Output 1:
+      2
+
+      Sample Input 2:
+      3
+      7 7 7
+      Sample Output 2:
+      3
+
+      Sample Input 3:
+      5
+      1 2 3 2 1
+      Sample Output 3:
+      0
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write answer to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+      import pytest
+
+      TEST_CASES = [
+          [
+              "7\n2 3 4 4 8 12 24\n",
+              "2\n"
+          ],
+          [
+              "3\n7 7 7\n",
+              "3\n"
+          ],
+          [
+              "5\n1 2 3 2 1\n",
+              "0\n"
+          ],
+          [
+              "13\n1 1 1 1 1 1 1 1 1 1 1 1 1\n",
+              "843230316\n"
+          ]
+      ]
+
+
+      def test_apps():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == str(expected).strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the APPS problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py to read from stdin and write the correct answer to stdout so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

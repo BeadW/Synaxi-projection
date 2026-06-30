@@ -1,0 +1,100 @@
+Feature: APPS/competition/3045 — competitive programming problem
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      The Manhattan Positioning System (MPS) is a modern variant of GPS, optimized for use in large cities. MPS assumes all positions are discrete points on a regular two-dimensional grid. Within MPS, a position is represented by a pair of integers $(X,Y)$.
+
+      To determine its position, an MPS receiver first measures its distance to a number of beacons. Beacons have known, fixed locations. MPS signals propagate only along the $X$ and $Y$ axes through the streets of the city, not diagonally through building blocks. When an MPS receiver at $(X_ R,Y_ R)$ measures its distance to a beacon at $(X_ B,Y_ B)$, it thus obtains the Manhattan distance: $|X_ R - X_ B|+|Y_ R - Y_ B|$.
+
+      Given the positions of a number of beacons and the Manhattan-distances between the receiver and each beacon, determine the position of the receiver. Note that the receiver must be at an integer grid position (MPS does not yet support fractional coordinates).
+
+      -----Input-----
+      The first line contains an integer $N$, the number of beacons ($1 \leq N \leq 1000$). Then follow $N$ lines, each containing three integers, $X_ i$, $Y_ i$, and $D_ i$, such that $-10^6 \leq X_ i, Y_ i \leq 10^6$ and $0 \leq D_ i \leq 4 \cdot 10^6$. The pair $(X_ i, Y_ i)$ denotes the position of beacon $i$, while $D_ i$ is the Manhattan distance between receiver and beacon $i$.
+
+      No two beacons have the same position.
+
+      -----Output-----
+      If there is exactly one receiver position consistent with the input, write one line with two integers, $X_ R$ and $Y_ R$, the position of the receiver.
+
+      If multiple receiver positions are consistent with the input, write one line with the word “uncertain”.
+
+      If no receiver position is consistent with the input, write one line with the word “impossible”.
+
+      -----Examples-----
+      Sample Input 1:
+      3
+      999999 0 1000
+      999900 950 451
+      987654 123 13222
+      Sample Output 1:
+      1000200 799
+
+      Sample Input 2:
+      2
+      100 0 101
+      0 200 199
+      Sample Output 2:
+      uncertain
+
+      Sample Input 3:
+      2
+      100 0 100
+      0 200 199
+      Sample Output 3:
+      impossible
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write answer to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+      import pytest
+
+      TEST_CASES = [
+          [
+              "3\n999999 0 1000\n999900 950 451\n987654 123 13222\n",
+              "1000200 799\n"
+          ],
+          [
+              "2\n100 0 101\n0 200 199\n",
+              "uncertain\n"
+          ],
+          [
+              "2\n100 0 100\n0 200 199\n",
+              "impossible\n"
+          ],
+          [
+              "2\n0 0 5\n10 0 6\n",
+              "impossible\n"
+          ]
+      ]
+
+
+      def test_apps():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == str(expected).strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the APPS problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py to read from stdin and write the correct answer to stdout so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0

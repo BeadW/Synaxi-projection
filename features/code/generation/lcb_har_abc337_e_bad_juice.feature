@@ -1,0 +1,71 @@
+Feature: LiveCodeBench/atcoder/hard — Bad Juice
+  Complexity: T3
+  Category: code/generation
+  Mode: multi-turn
+
+  Background:
+    Given the following project files:
+      """
+      === problem.txt ===
+      This is an interactive problem (a type of problem where your program interacts with the judge program through Standard Input and Output).
+      There are N bottles of juice, numbered 1 to N. It has been discovered that exactly one of these bottles has gone bad. Even a small sip of the spoiled juice will cause stomach upset the next day.
+      Takahashi must identify the spoiled juice by the next day. To do this, he decides to call the minimum necessary number of friends and serve them some of the N bottles of juice. He can give any number of bottles to each friend, and each bottle of juice can be given to any number of friends.
+      Print the number of friends to call and how to distribute the juice, then receive information on whether each friend has an upset stomach the next day, and print the spoiled bottle's number.
+
+      Input/Output
+
+      This is an interactive problem (a type of problem where your program interacts with the judge program through Standard Input and Output).
+      Before the interaction, the judge secretly selects an integer X between 1 and N as the spoiled bottle's number. The value of X is not given to you. Also, the value of X may change during the interaction as long as it is consistent with the constraints and previous outputs.
+      First, the judge will give you N as input.
+      N
+
+      You should print the number of friends to call, M, followed by a newline.
+      M
+
+      Next, you should perform the following procedure to print M outputs.
+      For i = 1, 2, \ldots, M, the i-th output should contain the number K_i of bottles of juice you will serve to the i-th friend, and the K_i bottles' numbers in ascending order, A_{i, 1}, A_{i, 2}, \ldots, A_{i, K_i}, separated by spaces, followed by a newline.
+      K_i A_{i, 1} A_{i, 2} \ldots A_{i, K_i}
+
+      Then, the judge will inform you whether each friend has a stomach upset the next day by giving you a string S of length M consisting of 0 and 1.
+      S
+
+      For i = 1, 2, \ldots, M, the i-th friend has a stomach upset if and only if the i-th character of S is 1.
+      You sho
+
+      === solution.py ===
+      import sys
+
+      # Read from stdin, write answer to stdout
+
+      === test_solution.py ===
+      import subprocess
+      import sys
+
+      TEST_CASES = [
+          [
+              "3 1\n",
+              "2\n1 2 \n1 3 \n2\n"
+          ]
+      ]
+
+
+      def test_lcb():
+          for i, (inp, expected) in enumerate(TEST_CASES):
+              r = subprocess.run(
+                  [sys.executable, "solution.py"],
+                  input=inp,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              assert r.returncode == 0, f"Case {i}: runtime error\n{r.stderr[:400]}"
+              assert r.stdout.strip() == str(expected).strip(), (
+                  f"Case {i}: expected {expected!r}, got {r.stdout!r}"
+              )
+
+      """
+
+  Scenario: Agent solves the LiveCodeBench problem so all tests pass
+    Given an agent is tasked with reading problem.txt and implementing solution.py to read from stdin and write the correct answer to stdout so all pytest tests pass
+    When the agent completes the task in the sandbox
+    Then pytest exits with code 0
