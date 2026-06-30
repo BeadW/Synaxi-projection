@@ -15,7 +15,7 @@ Published baselines (approximate, Sonnet-class models):
   LCB hard        ~25%   (LiveCodeBench 2024H2 leaderboard)
 
 Usage:
-  cd /Users/brad/Code/Synaxi-projection
+  cd /path/to/Synaxi-projection
   synaxi-projection-benchmark [--tasks N] [--model sonnet]
 """
 
