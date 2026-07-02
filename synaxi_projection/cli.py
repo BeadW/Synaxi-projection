@@ -12,39 +12,37 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_wrap = sub.add_parser("wrap", help="Wrap Claude Code with projection proxy")
-    p_wrap.add_argument(
-        "--upstream",
-        default="https://api.anthropic.com",
-        help="Upstream API base URL. Use http://127.0.0.1:11434 for Ollama. (default: Anthropic)",
-    )
+    p_wrap.add_argument("--upstream", default="https://api.anthropic.com",
+                        help="Upstream URL (default: Anthropic). Ollama: http://127.0.0.1:11434")
+    p_wrap.add_argument("--model", default="",
+                        help="Model name to send to Ollama (e.g. gemma4:latest, qwen2.5-coder:7b)")
     p_wrap.add_argument("--port", type=int, default=8787, help="Local proxy port (default: 8787)")
     p_wrap.add_argument("--no-proxy", action="store_true", help="Reuse already-running proxy")
-    # 'tool' and any extra claude args go in REMAINDER so --upstream can appear anywhere
-    p_wrap.add_argument("claude_args", nargs=argparse.REMAINDER, help="[claude] [extra claude args...]")
 
-    p_unwrap = sub.add_parser("unwrap", help="Remove proxy config and restore settings")
-    p_unwrap.add_argument("tool_args", nargs=argparse.REMAINDER)
-
+    sub.add_parser("unwrap", help="Remove proxy config and restore settings")
     sub.add_parser("status", help="Show wrapper/proxy status")
     sub.add_parser("doctor", help="Run health checks")
 
-    args = parser.parse_args()
+    # parse_known_args so that flags appearing after 'claude' are ours, not claude's
+    args, remaining = parser.parse_known_args()
 
     if args.cmd == "wrap":
-        # Strip leading 'claude' positional and any stray '--'
-        extra = [a for a in (args.claude_args or []) if a not in ("--", "claude")]
+        # strip 'claude' positional from remaining; everything else goes to claude binary
+        claude_args = tuple(a for a in remaining if a != "claude")
         wrap_claude(
             upstream=args.upstream,
             port=args.port,
-            claude_args=tuple(extra),
+            claude_args=claude_args,
             no_proxy=args.no_proxy,
+            model=args.model,
         )
-        return  # wrap_claude raises SystemExit; this is unreachable
+        return
+
+    if remaining:
+        parser.error(f"unrecognized arguments: {' '.join(remaining)}")
 
     if args.cmd == "unwrap":
-        out = unwrap_claude()
-        print(json.dumps(out, indent=2))
-        print("\n[synaxi-projection] unwrapped claude.")
+        print(json.dumps(unwrap_claude(), indent=2))
         return
 
     if args.cmd == "status":

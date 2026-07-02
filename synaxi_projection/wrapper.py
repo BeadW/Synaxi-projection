@@ -57,6 +57,8 @@ def _write_base_url(proxy_url: str, settings_path: Path) -> Optional[str]:
     previous = env_map.get("ANTHROPIC_BASE_URL")
     env_map["ANTHROPIC_BASE_URL"] = proxy_url
     env_map.setdefault("ENABLE_TOOL_SEARCH", "true")  # keep deferred tool schemas (Headroom #746)
+    if "api.anthropic.com" not in proxy_url:
+        env_map["ANTHROPIC_AUTH_TOKEN"] = "ollama"
     payload["env"] = env_map
     settings_path.write_text(json.dumps(payload, indent=2) + "\n")
     return previous
@@ -95,6 +97,7 @@ def wrap_claude(
     proxy_url: Optional[str] = None,
     claude_args: tuple = (),
     no_proxy: bool = False,
+    model: str = "",
 ) -> dict:
     """
     Start proxy, write settings.local.json, launch claude, restore on exit.
@@ -111,7 +114,7 @@ def wrap_claude(
         if not is_proxy_running(port):
             raise RuntimeError(f"--no-proxy: no proxy running on port {port}")
     else:
-        proxy_proc = start_proxy(port=port, upstream=upstream)
+        proxy_proc = start_proxy(port=port, upstream=upstream, model=model)
 
     settings_path = Path.cwd() / ".claude" / "settings.local.json"
     saved_base_url = _write_base_url(effective_proxy_url, settings_path)
@@ -129,9 +132,21 @@ def wrap_claude(
     env = os.environ.copy()
     env["ANTHROPIC_BASE_URL"] = effective_proxy_url
     env["ENABLE_TOOL_SEARCH"] = "true"
+    # Ollama accepts any non-empty auth token
+    is_ollama = "api.anthropic.com" not in upstream
+    if is_ollama:
+        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+
+    # Pass --model to claude binary so it doesn't try to validate the
+    # claude-* model name against the API before the first request.
+    # Only inject if the user hasn't already provided --model in claude_args.
+    effective_model = model or ("qwen2.5-coder:7b" if is_ollama else "")
+    final_claude_args = list(claude_args)
+    if effective_model and "--model" not in final_claude_args:
+        final_claude_args = ["--model", effective_model] + final_claude_args
 
     try:
-        result = subprocess.run([claude_bin, *claude_args], env=env)
+        result = subprocess.run([claude_bin, *final_claude_args], env=env)
         exit_code = result.returncode
     except KeyboardInterrupt:
         exit_code = 130
