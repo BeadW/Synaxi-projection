@@ -45,6 +45,11 @@ from typing import Optional
 # the MITM proxy. This avoids needing a separate ANTHROPIC_API_KEY.
 # ---------------------------------------------------------------------------
 from synaxi_projection.sandbox import TaskSandbox
+from synaxi_projection.projection import (
+    WorldCache,
+    ProjectionControlState,
+    generate_context,
+)
 
 # ---------------------------------------------------------------------------
 # Auth: Claude Code OAuth token via Synaxi MITM proxy
@@ -811,290 +816,6 @@ def _count_tool_use_blocks(content: list) -> int:
         for block in content
         if isinstance(block, dict) and block.get("type") == "tool_use"
     )
-
-
-def generate_context(
-    goal: str,
-    world: "WorldCache",
-    last_tool_use: list,
-    last_tool_result: list,
-    control_state: Optional[str] = None,
-    runtime_notice: Optional[str] = None,
-    cwd: str = "",
-) -> list[dict]:
-    """Construct the messages array for one agent invocation from current state.
-
-    World entries are emitted as native tool call pairs:
-      - file paths → synthesized read_file + tool_result
-      - "cmd:<command>" keys → synthesized run_command + tool_result
-
-    The model sees its own prior observations in the same format it produced them.
-    Token-weighted LRU eviction keeps the world block bounded.
-    """
-    cwd_note = f"\n\nWorking directory: {cwd}" if cwd else ""
-    control_note = ""
-    if control_state:
-        control_note = (
-            "\n\n<operational_memory>\n"
-            f"{control_state}\n"
-            "</operational_memory>\n"
-            "Apply this memory when choosing tools/commands unless a newer tool result disproves it."
-        )
-    notice = ""
-    if runtime_notice:
-        notice = (
-            "\n\n<runtime_reminder>\n"
-            f"{runtime_notice}\n"
-            "</runtime_reminder>"
-        )
-    msgs: list[dict] = [{"role": "user", "content": [
-        {"type": "text", "text": goal + cwd_note + control_note + notice}
-    ]}]
-
-    for key, content in world.items():
-        tool_id = f"syn_{abs(hash(key)) % 100000}"
-        if key.startswith("cmd:"):
-            command = key[4:]
-            msgs.append({"role": "assistant", "content": [
-                {"type": "tool_use", "id": tool_id, "name": "run_command", "input": {"command": command}}
-            ]})
-        else:
-            msgs.append({"role": "assistant", "content": [
-                {"type": "tool_use", "id": tool_id, "name": "read_file", "input": {"path": key}}
-            ]})
-        msgs.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tool_id, "content": content}
-        ]})
-
-    if last_tool_use:
-        msgs.append({"role": "assistant", "content": last_tool_use})
-    if last_tool_result:
-        msgs.append({"role": "user", "content": last_tool_result})
-
-    return msgs
-
-
-def _compress_messages(messages: list[dict], original_prompt: str, opener) -> list[dict]:
-    """Replace accumulated message history with a compact projected context.
-
-    Extracts:
-      - world_state: current file contents (last read per path, annotated if edited after)
-      - task_state: done/pending from Haiku summary of assistant reasoning
-    Returns a 3-message array: [user(compact), assistant(last_tool_use), user(last_result)]
-    """
-    # --- world state: track files by identity ---
-    file_contents: dict[str, str] = {}
-    edited_after_read: set[str] = set()
-    pending_read: Optional[tuple[str, str]] = None  # (tool_use_id, path)
-
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if role == "assistant" and btype == "tool_use":
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if name == "read_file":
-                    pending_read = (block["id"], inp.get("path", ""))
-                elif name == "write_file":
-                    path = inp.get("path", "")
-                    edited_after_read.add(path)
-                    file_contents.pop(path, None)  # invalidate stale read
-                    pending_read = None
-                else:
-                    pending_read = None
-            elif role == "user" and btype == "tool_result":
-                if pending_read and block.get("tool_use_id") == pending_read[0]:
-                    _, path = pending_read
-                    text = block.get("content", "")
-                    if isinstance(text, list):
-                        text = " ".join(b.get("text", "") for b in text if isinstance(b, dict))
-                    file_contents[path] = text[:4000]
-                    edited_after_read.discard(path)
-                    pending_read = None
-
-    world_lines = []
-    for path, content in file_contents.items():
-        world_lines.append(f"=== {path} ===\n{content}")
-    world_state = "\n\n".join(world_lines) if world_lines else "(no files read yet)"
-
-    # --- task state: Haiku extracts done/pending from assistant reasoning ---
-    assistant_texts = []
-    for m in messages:
-        if m.get("role") == "assistant":
-            for block in (m.get("content") or []):
-                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                    assistant_texts.append(block["text"])
-
-    task_state_text = ""
-    if assistant_texts:
-        haiku_prompt = (
-            "These are reasoning messages from a coding agent (oldest first):\n\n"
-            + "\n---\n".join(assistant_texts[-10:])
-            + '\n\nExtract current progress. Return JSON only: '
-            '{"done": ["..."], "pending": ["..."]}\n'
-            'done = steps explicitly completed. pending = steps committed but not done. '
-            'Keep each item under 80 chars.'
-        )
-        haiku_resp = _api_call(opener, {
-            "model": MODEL_IDS["haiku"],
-            "max_tokens": 512,
-            "messages": [{"role": "user", "content": haiku_prompt}],
-        }, timeout=30)
-        for block in (haiku_resp.get("content") or []):
-            if isinstance(block, dict) and block.get("type") == "text":
-                try:
-                    m = re.search(r'\{.*\}', block["text"], re.DOTALL)
-                    if m:
-                        ts = json.loads(m.group())
-                        done = ts.get("done") or []
-                        pending = ts.get("pending") or []
-                        if done:
-                            task_state_text += "Done:\n" + "\n".join(f"  ✓ {d}" for d in done)
-                        if pending:
-                            task_state_text += "\nPending:\n" + "\n".join(f"  → {p}" for p in pending)
-                except Exception:
-                    pass
-
-    # --- last tool_use + result pair ---
-    last_tool_use = None
-    last_tool_result = None
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and not last_tool_use:
-            for block in (m.get("content") or []):
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    last_tool_use = m
-                    break
-        elif m.get("role") == "user" and not last_tool_result and last_tool_use:
-            for block in (m.get("content") or []):
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    last_tool_result = m
-                    break
-        if last_tool_use and last_tool_result:
-            break
-
-    compact_user = (
-        f"<original_task>\n{original_prompt}\n</original_task>\n\n"
-        f"<task_progress>\n{task_state_text or '(in progress)'}\n</task_progress>\n\n"
-        f"<current_files>\n{world_state}\n</current_files>\n\n"
-        f"Continue the task. Do NOT re-read files already shown above."
-    )
-
-    result = [{"role": "user", "content": compact_user}]
-    if last_tool_use:
-        result.append(last_tool_use)
-    if last_tool_result:
-        result.append(last_tool_result)
-    return result
-
-
-class WorldCache:
-    """Observation cache for the projection agent.
-
-    Stores files read and command output. Eviction is token-weighted:
-    large entries that haven't been used recently cost the most to keep
-    and are evicted first. Small entries like ls output stay around longer.
-
-    Eviction strategy: score = tokens * turns_since_used.
-    When total tokens exceed budget, evict highest-score entries first.
-    """
-
-    def __init__(self, token_budget: int = 8000):
-        self._budget = token_budget
-        self._store: dict[str, str] = {}
-        self._last_used: dict[str, int] = {}
-        self._turn: int = 0
-
-    def tick(self) -> None:
-        """Advance turn, evict entries if over token budget."""
-        self._turn += 1
-        total = sum(len(v) // 4 for v in self._store.values())
-        if total <= self._budget:
-            return
-        # Score = token_cost * turns_since_used — highest score evicts first
-        scored = sorted(
-            self._store.keys(),
-            key=lambda k: (len(self._store[k]) // 4) * (self._turn - self._last_used[k]),
-            reverse=True,
-        )
-        for k in scored:
-            token_cost = len(self._store[k]) // 4
-            del self._store[k]
-            del self._last_used[k]
-            total -= token_cost
-            if total <= self._budget:
-                break
-
-    def put(self, key: str, content: str) -> None:
-        self._store[key] = content
-        self._last_used[key] = self._turn
-
-    def items(self):
-        return self._store.items()
-
-
-class ProjectionControlState:
-    """Small persistent operational memory for projection-mode recovery.
-
-    Learns from repeated tool failures (e.g., `python` unavailable, reading dirs as files)
-    and provides concise reminders in the next turn's compact context.
-    """
-
-    def __init__(self) -> None:
-        self._facts: dict[str, str] = {}
-        self._error_counts: dict[str, int] = {}
-
-    def _remember(self, key: str, text: str) -> None:
-        self._facts[key] = text
-
-    def _bump_error(self, signature: str) -> int:
-        nxt = self._error_counts.get(signature, 0) + 1
-        self._error_counts[signature] = nxt
-        return nxt
-
-    def observe(self, tool_name: str, tool_input: dict, result_text: str) -> None:
-        lower = (result_text or "").lower()
-
-        if tool_name == "run_command":
-            cmd = str(tool_input.get("command", ""))
-            if "python: command not found" in lower:
-                self._remember("python_bin", "Use `python3` (not `python`) in this sandbox.")
-
-            if "exit=0" in lower and "python3" in cmd:
-                self._remember("python_bin_confirmed", "`python3` works here; keep using it for test/validation commands.")
-
-        if tool_name == "read_file":
-            if "is a directory" in lower:
-                self._remember(
-                    "read_file_directory",
-                    "`read_file` expects a file path; use `run_command` (`ls`/`find`) for directory discovery.",
-                )
-
-            if "not found" in lower:
-                seen = self._bump_error("read_file:not_found")
-                if seen >= 2:
-                    self._remember(
-                        "path_resolution",
-                        "When paths fail, list files first (`ls`, `find . -maxdepth 3 -type f`) then read exact file paths.",
-                    )
-
-        if "tool error" in lower:
-            seen = self._bump_error(f"tool_error:{tool_name}")
-            if seen >= 2:
-                self._remember(
-                    f"repeat_{tool_name}",
-                    f"Repeated {tool_name} errors detected; change strategy before retrying the same call.",
-                )
-
-    def render(self) -> str:
-        if not self._facts:
-            return "(none yet)"
-        return "\n".join(f"- {item}" for item in self._facts.values())
 
 
 def _snapshot_mtimes(directory: Path) -> dict:
@@ -1899,6 +1620,244 @@ def run_benchmark_task(task: dict, model: str, use_annotation: bool, max_turns: 
 
 
 # ---------------------------------------------------------------------------
+# Claude Code subprocess strategy  (uses `claude -p` via projection proxy)
+# ---------------------------------------------------------------------------
+
+DEFAULT_CLAUDE_CODE_PROXY = "http://127.0.0.1:8787"
+
+
+def run_benchmark_task_claude_code(
+    task: dict,
+    model: str = "qwen2.5-coder:7b",
+    proxy_url: str = DEFAULT_CLAUDE_CODE_PROXY,
+    fs_tracker_mode: str = "auto",
+    require_fuse: bool = False,
+    run_timeout: int = 600,
+    validation_timeout: int = DEFAULT_VALIDATION_TIMEOUT,
+    condition: str = "claude-code",
+    native_auth: bool = False,
+) -> dict:
+    """
+    Run a benchmark task using ``claude -p`` pointed at the projection proxy.
+
+    The proxy handles context compression and logs every request/response to
+    ~/.synaxi-projection/conversations/.  FUSE tracker intercepts file I/O
+    so we know exactly which files claude read/wrote without parsing its output.
+    """
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise RuntimeError("'claude' not found in PATH — install Claude Code first")
+
+    if task.get("uses_exec_script"):
+        prompt = (
+            f"You are working in a sandbox directory. Your task: {task['task']}. "
+            f"validate.py contains assertions that test your implementation. "
+            f"Do NOT modify validate.py. Write your implementation in solution.py. "
+            f"Run: python3 -c \"from solution import *; exec(open('validate.py').read())\" "
+            f"to verify. It must exit 0."
+        )
+    else:
+        prompt = f"You are working in a sandbox directory. {task['task']}."
+
+    with TaskSandbox(task["files"]) as sb:
+        original_files = dict(task["files"])
+        protected_files = _collect_protected_files(task["files"])
+        convo_dir = Path.home() / ".synaxi-projection" / "conversations"
+        convo_dir.mkdir(parents=True, exist_ok=True)
+        before_counts: dict[Path, int] = {}
+        for p in convo_dir.glob("*.jsonl"):
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    before_counts[p] = sum(1 for _ in f)
+            except Exception:
+                before_counts[p] = 0
+
+        fs_tracker: Optional[FileSystemTracker] = FileSystemTracker(
+            sb.path, mode=fs_tracker_mode, require_fuse=require_fuse
+        )
+        exec_cwd = fs_tracker.exec_root if fs_tracker else sb.path
+
+        env = os.environ.copy()
+        env["ANTHROPIC_BASE_URL"]   = proxy_url
+        if native_auth:
+            # Real Claude subscription: let `claude -p` use its own
+            # stored OAuth credentials. We deliberately do NOT set
+            # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, so claude sends
+            # its genuine Authorization header, which the proxy forwards
+            # verbatim upstream to api.anthropic.com. Projection still
+            # applies inside the proxy; only destination + auth differ.
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        else:
+            env["ANTHROPIC_API_KEY"]    = "ollama"   # API-key auth -> local proxy -> Ollama
+            env["ANTHROPIC_AUTH_TOKEN"] = "ollama"   # fallback for OAuth-style check
+
+        # --dangerously-skip-permissions: run non-interactively so Edit/Write
+        # tools don't block on a permission prompt (no TTY in subprocess mode).
+        cmd = [claude_bin, "-p", prompt, "--model", model,
+               "--dangerously-skip-permissions"]
+
+        t0 = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=run_timeout,
+                cwd=exec_cwd,
+                env=env,
+            )
+            elapsed = round(time.time() - t0, 1)
+            response = proc.stdout.strip()
+            stderr   = proc.stderr.strip()
+            exit_ok  = proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            elapsed  = round(time.time() - t0, 1)
+            response = ""
+            stderr   = f"claude -p timed out after {run_timeout}s"
+            exit_ok  = False
+
+        if fs_tracker:
+            fs_tracker.close()
+
+        changed_protected = _detect_protected_file_changes(
+            sb.path, original_files=original_files, protected_files=protected_files,
+        )
+
+        if task.get("uses_exec_script") and task.get("validation_script"):
+            runner = Path(sb.path) / "_synaxi_validate_runner.py"
+            runner.write_text(
+                "from solution import *\n\n" + task["validation_script"] + "\n",
+                encoding="utf-8",
+            )
+            r = subprocess.run(
+                ["python3", runner.name],
+                cwd=sb.path, capture_output=True, text=True, timeout=validation_timeout,
+            )
+            passed = r.returncode == 0
+            pytest_output = (r.stdout + r.stderr)[:500]
+        else:
+            passed, pytest_output = sb.run_pytest(timeout=validation_timeout)
+
+        if changed_protected:
+            passed = False
+            pytest_output = (
+                f"integrity_violation: {', '.join(changed_protected)}\n" + pytest_output
+            )[:500]
+
+        # Pull per-run turn/token/tool stats from proxy JSONL logs.
+        log_entries: list[tuple[Path, dict]] = []
+        for p in sorted(convo_dir.glob("*.jsonl")):
+            start_idx = before_counts.get(p, 0)
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        if i < start_idx:
+                            continue
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        ts = row.get("ts")
+                        if isinstance(ts, (int, float)) and ts < (t0 - 2):
+                            continue
+                        log_entries.append((p, row))
+            except Exception:
+                continue
+
+        turns = len(log_entries)
+        input_tokens = 0
+        output_tokens = 0
+        tool_calls = 0
+        conversation_log_path = None
+        source_proxy_session_file = None
+        run_id = None
+
+        for _, row in log_entries:
+            resp = row.get("response") or {}
+            usage = resp.get("usage") or {}
+            input_tokens += int(usage.get("input_tokens", 0) or 0)
+            output_tokens += int(usage.get("output_tokens", 0) or 0)
+            for block in (resp.get("content") or []):
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_calls += 1
+            if not run_id and row.get("run_id"):
+                run_id = row.get("run_id")
+
+        if log_entries:
+            # Use the file that contributed the most entries to this run.
+            by_file: dict[Path, int] = {}
+            for p, _ in log_entries:
+                by_file[p] = by_file.get(p, 0) + 1
+            source_proxy_session_file = str(max(by_file, key=by_file.get))
+
+        # Write a dedicated per-run full conversation artifact (harness-style).
+        # This preserves all observed proxy turns for post-run analysis.
+        try:
+            safe_task_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task.get("id", "unknown")))
+            ts_now = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            out_dir = CONVERSATION_HISTORY_DIR / "claude_code"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{ts_now}_{safe_task_id}_{condition}.json"
+            payload = {
+                "started_at_utc": dt.datetime.utcfromtimestamp(t0).isoformat() + "Z",
+                "finished_at_utc": dt.datetime.utcnow().isoformat() + "Z",
+                "task_id": task.get("id"),
+                "source": task.get("source"),
+                "condition": condition,
+                "model": model,
+                "proxy_url": proxy_url,
+                "prompt": prompt,
+                "claude_command": cmd,
+                "claude_exit_ok": exit_ok,
+                "claude_stdout": response,
+                "claude_stderr": stderr,
+                "fs_tracker_mode": fs_tracker.active_mode if fs_tracker else "none",
+                "fs_tracker_fuse_error": fs_tracker.fuse_error if fs_tracker else None,
+                "proxy_session_file": source_proxy_session_file,
+                "turn_count": turns,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "tool_calls": tool_calls,
+                "proxy_entries": [row for _, row in log_entries],
+            }
+            out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            conversation_log_path = str(out_path)
+        except Exception:
+            # Keep benchmark flow resilient; do not fail task scoring on log write errors.
+            pass
+
+        if turns > 0:
+            # If proxy observed turns, prefer that signal even if claude stderr had warnings.
+            exit_ok = True
+
+    return {
+        "task_id":           task["id"],
+        "source":            task["source"],
+        "condition":         condition,
+        "passed":            passed,
+        "model":             model,
+        "provider":          "claude-code",
+        "fs_tracker_mode":   fs_tracker.active_mode if fs_tracker else "none",
+        "fs_tracker_fuse_error": fs_tracker.fuse_error if fs_tracker else None,
+        "run_id":            run_id,
+        "conversation_log_path": conversation_log_path,
+        "conversation_log_file": (Path(conversation_log_path).name if conversation_log_path else None),
+        "turns":             turns,
+        "tool_calls":        tool_calls,
+        "input_tokens":      input_tokens,
+        "output_tokens":     output_tokens,
+        "cost_usd":          0.0,
+        "elapsed_s":         elapsed,
+        "pytest_output":     pytest_output[:500],
+        "last_error":        stderr[:300] if not exit_ok else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1933,6 +1892,10 @@ def main():
                         help="Run a single task by stem name (e.g. t3_diff_engine)")
     parser.add_argument("--projection", action="store_true",
                         help="Use constant-space context (projection mode)")
+    parser.add_argument("--claude-code", action="store_true",
+                        help="Use 'claude -p' via projection proxy instead of direct API")
+    parser.add_argument("--proxy-url", default=DEFAULT_CLAUDE_CODE_PROXY,
+                        help=f"Projection proxy URL for --claude-code (default: {DEFAULT_CLAUDE_CODE_PROXY})")
     args = parser.parse_args()
 
     effective_provider_timeout = (
@@ -1946,7 +1909,7 @@ def main():
         else (1200 if args.provider == "ollama" else DEFAULT_RUN_TIMEOUT)
     )
 
-    if args.provider == "anthropic" and args.model not in MODEL_IDS and not args.model.startswith("claude-"):
+    if not getattr(args, 'claude_code', False) and args.provider == "anthropic" and args.model not in MODEL_IDS and not args.model.startswith("claude-"):
         print("ERROR: for --provider anthropic, --model must be one of haiku|sonnet|opus or full claude-* id")
         sys.exit(1)
 
@@ -1996,16 +1959,27 @@ def main():
     print()
 
     all_results: list[dict] = []
-    if args.projection:
+    if getattr(args, 'claude_code', False):
+        conditions = ["claude-code"]
+    elif args.projection:
         conditions = ["projection"]
     else:
         conditions = ["baseline"]
 
     for condition in conditions:
-        use_ann = condition == "annotation"
+        use_ann  = condition == "annotation"
         use_proj = condition == "projection"
+        use_cc   = condition == "claude-code"
         print(f"\n{'─'*65}")
         print(f"CONDITION: {condition.upper()}")
+        if use_cc:
+            print(f"  proxy: {args.proxy_url}  model: {args.model}")
+            try:
+                urllib.request.urlopen(args.proxy_url + "/health", timeout=2)
+            except Exception as e:
+                print(f"\nERROR: proxy not reachable at {args.proxy_url}: {e}")
+                print("Start: synaxi-projection wrap claude --upstream http://127.0.0.1:11434")
+                sys.exit(1)
         print(f"{'─'*65}")
 
         for i, task in enumerate(tasks):
@@ -2015,17 +1989,29 @@ def main():
             print(f"  → Running...", end="", flush=True)
 
             try:
-                r = run_benchmark_task(task, args.model, use_annotation=use_ann,
-                                       projection=use_proj,
-                                       provider=args.provider,
-                                       ollama_url=args.ollama_url,
-                                       provider_timeout=effective_provider_timeout,
-                                       run_timeout=effective_run_timeout,
-                                       tool_command_timeout=args.command_timeout,
-                                       fs_tracker_mode=args.fs_tracker,
-                                       require_fuse=args.require_fuse,
-                                       validation_timeout=args.validation_timeout,
-                                       condition=condition)
+                if use_cc:
+                    r = run_benchmark_task_claude_code(
+                        task,
+                        model=args.model,
+                        proxy_url=args.proxy_url,
+                        fs_tracker_mode=args.fs_tracker,
+                        require_fuse=args.require_fuse,
+                        run_timeout=effective_run_timeout,
+                        validation_timeout=args.validation_timeout,
+                        condition=condition,
+                    )
+                else:
+                    r = run_benchmark_task(task, args.model, use_annotation=use_ann,
+                                           projection=use_proj,
+                                           provider=args.provider,
+                                           ollama_url=args.ollama_url,
+                                           provider_timeout=effective_provider_timeout,
+                                           run_timeout=effective_run_timeout,
+                                           tool_command_timeout=args.command_timeout,
+                                           fs_tracker_mode=args.fs_tracker,
+                                           require_fuse=args.require_fuse,
+                                           validation_timeout=args.validation_timeout,
+                                           condition=condition)
                 status = "PASS" if r["passed"] else "FAIL"
                 col = "\033[92m" if r["passed"] else "\033[91m"
                 reset = "\033[0m"
@@ -2046,8 +2032,9 @@ def main():
                     "turns": 0, "tool_calls": 0, "cost_usd": 0, "elapsed_s": 0,
                 })
 
-            # Pause between tasks to stay under rate limits
-            time.sleep(30)
+            # No rate-limit pause for local/claude-code runs
+            if not use_cc:
+                time.sleep(30)
 
     # Results summary
     print("\n\n" + "=" * 65)
