@@ -39,7 +39,7 @@ import argparse
 import json
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -199,7 +199,7 @@ def print_summary(s: dict) -> None:
           f"wall: {s['wall_s']/60:.1f} min")
     tk = s["tokens"]
     if tk["context"]:
-        print(f"  tokens:")
+        print("  tokens:")
         print(f"    fresh input:  {_fmt(tk['input']):>14}")
         print(f"    cache WRITE:  {_fmt(tk['cache_write']):>14}   (1.25-2x)")
         print(f"    cache READ:   {_fmt(tk['cache_read']):>14}   (0.1x)")

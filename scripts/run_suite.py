@@ -35,7 +35,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from synaxi_projection.benchmark import (  # noqa: E402
-    DEFAULT_CLAUDE_CODE_PROXY,
     OLLAMA_URL,
     load_synaxi_tasks,
     run_benchmark_task,
@@ -305,7 +304,7 @@ def main() -> None:
     avg_turns = (sum(r.get("turns", 0) for r in results) / n) if n else 0
     print(f"\n  Avg turns: {avg_turns:.1f}   tokens in/out: {tot_in}/{tot_out}")
     print(f"  Suite log: {suite_file}")
-    print(f"  Failures:  " + (", ".join(r["task_id"] for r in results if not r.get("passed")) or "none"))
+    print("  Failures:  " + (", ".join(r["task_id"] for r in results if not r.get("passed")) or "none"))
 
 
 if __name__ == "__main__":

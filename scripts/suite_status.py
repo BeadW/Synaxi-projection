@@ -31,7 +31,7 @@ def main():
         print("no suite results file found")
         return
 
-    rows = [json.loads(l) for l in open(suite) if l.strip()]
+    rows = [json.loads(line) for line in open(suite) if line.strip()]
     done = len(rows)
     passed = sum(1 for r in rows if r.get("passed"))
     failed = done - passed
