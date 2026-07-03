@@ -146,9 +146,37 @@ def _message_to_sse(msg):
                           "partial_json": json.dumps(block.get("input", {}))}})
             out += _sse_event("content_block_stop", {
                 "type": "content_block_stop", "index": i})
+        elif btype == "thinking":
+            # Extended-thinking block. Claude Code builds the block from an
+            # empty start frame plus DELTAS, ignoring any thinking/signature
+            # placed inline in content_block_start. With adaptive thinking the
+            # model often returns empty thinking text but a long ``signature``
+            # (Anthropic verifies the block by that signature on the next turn).
+            # If we don't replay the signature via a ``signature_delta`` the
+            # client reconstructs {"thinking":"","signature":""}, echoes that
+            # back next turn, and Anthropic rejects it with "each thinking block
+            # must contain thinking" — surfaced to the user as an empty/HTTP-200
+            # error. So stream it the way the client expects.
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "thinking", "thinking": ""}})
+            thinking_text = block.get("thinking") or ""
+            if thinking_text:
+                out += _sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": i,
+                    "delta": {"type": "thinking_delta", "thinking": thinking_text}})
+            signature = block.get("signature") or ""
+            if signature:
+                out += _sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": i,
+                    "delta": {"type": "signature_delta", "signature": signature}})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
         else:
-            # thinking / redacted_thinking / unknown: pass the whole block
-            # through in the start frame so the client still receives it.
+            # redacted_thinking / unknown: opaque to us (a redacted_thinking
+            # block carries its payload in ``data``, not deltas), so pass the
+            # whole block through in the start frame — the client stores it
+            # verbatim and can return it unchanged.
             out += _sse_event("content_block_start", {
                 "type": "content_block_start", "index": i,
                 "content_block": block})

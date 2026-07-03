@@ -100,6 +100,61 @@ def test_error_object_becomes_sse_error_event(proxymod):
     assert "overloaded_error" in sse.decode()
 
 
+def test_thinking_block_replays_signature_via_delta(proxymod):
+    """Regression: adaptive thinking returns empty thinking text + a signature.
+
+    Claude Code rebuilds thinking blocks from deltas, not from the inline
+    content_block_start, so the signature MUST be replayed as a signature_delta.
+    Otherwise the client reconstructs {"thinking":"","signature":""}, echoes it
+    back next turn, and Anthropic rejects it with "each thinking block must
+    contain thinking" (surfaced as an empty/HTTP-200 error).
+    """
+    sse = proxymod._message_to_sse({
+        "type": "message", "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "", "signature": "SIG-4720-CHARS"},
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"command": "ls"}},
+        ],
+        "stop_reason": "tool_use", "usage": {"input_tokens": 5, "output_tokens": 9},
+    })
+    frames = _frames(sse)
+    # The thinking block starts empty and its signature arrives via a delta.
+    starts = [d for e, d in frames if e == "content_block_start"]
+    think_start = next(d for d in starts if d["content_block"].get("type") == "thinking")
+    assert think_start["content_block"] == {"type": "thinking", "thinking": ""}
+    sig_deltas = [d for e, d in frames
+                  if e == "content_block_delta"
+                  and d["delta"].get("type") == "signature_delta"]
+    assert len(sig_deltas) == 1
+    assert sig_deltas[0]["delta"]["signature"] == "SIG-4720-CHARS"
+
+
+def test_thinking_with_text_replays_both_deltas(proxymod):
+    sse = proxymod._message_to_sse({
+        "type": "message", "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "let me reason",
+                     "signature": "SIG"}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    kinds = [d["delta"]["type"] for e, d in _frames(sse) if e == "content_block_delta"]
+    assert kinds == ["thinking_delta", "signature_delta"]
+    assert "let me reason" in sse.decode()
+
+
+def test_redacted_thinking_passes_through_whole(proxymod):
+    """redacted_thinking carries its payload in ``data`` (no deltas), so it must
+    be delivered whole in the start frame."""
+    sse = proxymod._message_to_sse({
+        "type": "message", "role": "assistant",
+        "content": [{"type": "redacted_thinking", "data": "ENCRYPTED-BLOB"}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    starts = [d for e, d in _frames(sse) if e == "content_block_start"]
+    rt = next(d for d in starts if d["content_block"].get("type") == "redacted_thinking")
+    assert rt["content_block"]["data"] == "ENCRYPTED-BLOB"
+
+
 def test_empty_response_is_graceful(proxymod):
     # An unparseable/empty upstream body must still yield a valid, non-blank
     # frame set the client can parse — never a bare body it would call "malformed".
