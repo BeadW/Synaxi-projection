@@ -20,6 +20,32 @@ It can drive two execution paths against the same projection engine:
 
 ---
 
+## Quick Start: Use with Claude Code
+
+```bash
+pip install -e .
+
+# Wrap the Claude Code TUI (uses your existing Claude subscription/auth).
+# Launches the synaxi-chat orchestrator, which delegates coding to the
+# projected synaxi-worker subagent.
+synaxi-projection wrap claude
+```
+
+That's it — this starts the projection proxy, routes Claude Code through it,
+and launches `claude` as usual. Use it like normal Claude Code; only the
+worker subagent's requests get projected. When you're done, exit the session
+and optionally clean up:
+
+```bash
+synaxi-projection status
+synaxi-projection doctor
+synaxi-projection unwrap claude
+```
+
+See [Install](#install) and [Run](#run) below for more configuration options.
+
+---
+
 ## Results
 
 On a 31-task coding suite (10×T2, 12×T3, 9×T4), driven through the **same**
