@@ -13,10 +13,12 @@ from pathlib import Path
 from synaxi_projection.wrapper import (
     DEFAULT_AGENT,
     _agent_available,
+    _agents_target_dir,
+    _bundled_agents,
     _finalize_claude_args,
+    _install_agents,
+    _uninstall_agents,
 )
-
-REPO = Path(__file__).resolve().parent.parent
 
 
 # --- _finalize_claude_args (pure) -------------------------------------------
@@ -69,17 +71,79 @@ def test_existing_user_args_preserved_after_defaults():
     assert "--agent" in out and "--model" in out
 
 
-# --- _agent_available (touches disk) ----------------------------------------
+# --- bundled agents ---------------------------------------------------------
 
-def test_default_agents_exist_in_this_repo():
-    """The agents we ship must be discoverable from the repo root."""
-    assert _agent_available(DEFAULT_AGENT, cwd=REPO) is True
-    assert _agent_available("synaxi-worker", cwd=REPO) is True
+def test_bundled_agents_present():
+    """The definitions we ship (and install at wrap time) must exist."""
+    names = {p.name for p in _bundled_agents()}
+    assert {"synaxi-worker.md", "synaxi-chat.md"} <= names
 
 
-def test_unknown_agent_not_available(tmp_path):
+# --- _agent_available (honors CLAUDE_CONFIG_DIR) ----------------------------
+
+def test_unknown_agent_not_available(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     assert _agent_available("does-not-exist", cwd=tmp_path) is False
 
 
 def test_empty_agent_not_available():
-    assert _agent_available("", cwd=REPO) is False
+    assert _agent_available("") is False
+
+
+def test_agent_available_after_install(tmp_path, monkeypatch):
+    """Installing the bundle makes --agent injection light up."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert _agent_available(DEFAULT_AGENT, cwd=tmp_path) is False
+    _install_agents(_agents_target_dir())
+    assert _agent_available(DEFAULT_AGENT, cwd=tmp_path) is True
+    assert _agent_available("synaxi-worker", cwd=tmp_path) is True
+
+
+# --- install / uninstall lifecycle ------------------------------------------
+
+def test_install_creates_files_and_uninstall_prunes(tmp_path):
+    target = tmp_path / "cfg" / ".claude" / "agents"
+    manifest = _install_agents(target)
+
+    installed = {Path(r["path"]).name for r in manifest["agents"]}
+    assert {"synaxi-worker.md", "synaxi-chat.md"} <= installed
+    for r in manifest["agents"]:
+        assert Path(r["path"]).exists()
+    # Worker file must carry the sentinel or the proxy gate never fires.
+    assert "SYNAXI-PROJECTION-WORKER" in (target / "synaxi-worker.md").read_text()
+
+    _uninstall_agents(manifest)
+    for r in manifest["agents"]:
+        assert not Path(r["path"]).exists()
+    # Directories we created are pruned back out; tmp_path itself remains.
+    assert not target.exists()
+    assert not (tmp_path / "cfg").exists()
+    assert tmp_path.exists()
+
+
+def test_uninstall_restores_preexisting_user_agent(tmp_path):
+    """A user's own same-named agent is restored verbatim, never deleted."""
+    target = tmp_path / "agents"
+    target.mkdir(parents=True)
+    user = target / "synaxi-worker.md"
+    user.write_text("USER OWN CONTENT")
+
+    manifest = _install_agents(target)
+    # During the session our bundled content is active...
+    assert "SYNAXI-PROJECTION-WORKER" in user.read_text()
+
+    _uninstall_agents(manifest)
+    # ...and afterwards the original is put back, and the pre-existing dir kept.
+    assert user.read_text() == "USER OWN CONTENT"
+    assert target.exists()
+
+
+def test_uninstall_is_idempotent_and_tolerant(tmp_path):
+    target = tmp_path / "agents"
+    manifest = _install_agents(target)
+    _uninstall_agents(manifest)
+    _uninstall_agents(manifest)          # second call: no-op, no exception
+    _uninstall_agents(None)              # empty inputs tolerated
+    _uninstall_agents({})
+    _uninstall_agents({"agents": [], "created_dirs": []})
+    assert not target.exists()

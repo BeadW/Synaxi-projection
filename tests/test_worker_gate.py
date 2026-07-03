@@ -9,8 +9,6 @@ files and the code constant never drift apart.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 from synaxi_projection.projection import (
     PROJECTION_SYSTEM,
     WORKER_SENTINEL,
@@ -18,9 +16,9 @@ from synaxi_projection.projection import (
     project_payload,
     system_text,
 )
+from synaxi_projection.wrapper import _BUNDLED_AGENTS_DIR
 
-REPO = Path(__file__).resolve().parent.parent
-AGENTS = REPO / ".claude" / "agents"
+AGENTS = _BUNDLED_AGENTS_DIR
 
 
 def _worker_system_list():
