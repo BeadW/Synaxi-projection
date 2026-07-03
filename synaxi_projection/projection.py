@@ -23,7 +23,8 @@ prompt + ~60 tool schemas + every prior turn) to a small local model, we
 rebuild a *constant-space* context from the durable facts the agent has
 observed — the files it has read/written and the commands it has run — and
 re-emit them as native, correctly-paired ``tool_use`` / ``tool_result``
-messages, plus a small ``<operational_memory>`` block of lessons learned.
+messages, plus — only when the agent is stuck in an action cycle — a small
+``<operational_memory>`` nudge derived from *structural* loop detection.
 
 Why native tool pairs (not a prose summary)
 -------------------------------------------
@@ -54,11 +55,13 @@ compressed back into the model's context). See the README for the full diagram.
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
+from typing import Callable, NamedTuple, Optional, Sequence
 
 __all__ = [
     "WorldCache",
     "ProjectionControlState",
+    "ActionRecord",
+    "detect_action_cycle",
     "generate_context",
     "project_payload",
     "build_world_from_messages",
@@ -113,8 +116,9 @@ _DIALECTS = {
     "claude": {"read": ("Read", "file_path"), "cmd": ("Bash", "command")},
 }
 
-# Map vendor tool names onto the harness vocabulary so ProjectionControlState's
-# heuristics (which key off "run_command" / "read_file") work for either source.
+# Map vendor tool names onto the harness vocabulary so world-ingest and the
+# cycle-detector's action *identity* treat both dialects (`Read`/`read_file`,
+# `Bash`/`run_command`) as the same action.
 _NAME_MAP = {
     "Read": "read_file",
     "Write": "write_file",
@@ -205,66 +209,166 @@ class WorldCache:
 
 
 # ===========================================================================
-# ProjectionControlState — small persistent operational memory
+# ProjectionControlState — structural action-cycle detection
 # ===========================================================================
+#
+# The projection agent has no scratchpad: each turn it sees only the
+# reconstructed world plus the live tool pair. Left alone, small models fall
+# into *action cycles* — re-running `ls`, re-reading the same file, or bouncing
+# between two actions — because nothing in the context tells them they are
+# stuck.
+#
+# We deliberately do NOT pattern-match error strings here. Doing so bakes in
+# assumptions about the sandbox (a particular OS, a particular missing binary,
+# a particular error message) that we never actually probed and that will not
+# generalize. Instead we keep an append-only *action history* OUTSIDE the model
+# context and detect repetition purely structurally: an action — or a short
+# cycle of actions — that recurs with an *identical result* is, by definition,
+# making no progress. The only thing that reaches the model is a short, generic
+# "you are looping, change approach" nudge; the full history stays in the
+# harness (see :attr:`ProjectionControlState.history`).
+#
+# This is environment-agnostic: it never assumes what a "good" command is, only
+# that repeating the same thing and getting the same answer is not progress.
+
+
+class ActionRecord(NamedTuple):
+    """One executed tool call, reduced to its identity + result fingerprint."""
+
+    kind: str          # coarse action kind: "read" | "write" | "cmd"
+    key: str           # normalized identity: a file path, or the command string
+    result_hash: str   # fingerprint of the result (detects "same answer again")
+
+
+# Map every tool dialect onto a coarse action *kind*. This is identity, not
+# advice: it exists only so equivalent actions across dialects collapse to one
+# signature when detecting repetition. Tools not listed here (Glob/Grep/Web*)
+# are not tracked for cycle detection.
+_ACTION_KIND = {
+    "read": "read", "read_file": "read",
+    "write": "write", "write_file": "write",
+    "edit": "write", "str_replace": "write", "str_replace_based_edit_tool": "write",
+    "bash": "cmd", "run_command": "cmd",
+}
+
+
+def _result_fingerprint(text: Optional[str]) -> str:
+    return hashlib.md5((text or "").encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _action_identity(kind: str, tool_input: dict) -> str:
+    """Normalized identity for an action, ignoring its result."""
+    if kind in ("read", "write"):
+        return _path_of(tool_input) or ""
+    if kind == "cmd":
+        # Collapse incidental whitespace so `ls  -F` and `ls -F` are one action.
+        return " ".join(str(tool_input.get("command", "")).split())
+    return str(sorted((str(k), str(v)) for k, v in (tool_input or {}).items()))
+
+
+def _trailing_cycle_repeats(history: Sequence["ActionRecord"], length: int) -> int:
+    """How many times the trailing block of ``length`` records repeats back-to-back."""
+    block = history[-length:]
+    count, i = 0, len(history)
+    while i >= length and history[i - length:i] == block:
+        count += 1
+        i -= length
+    return count
+
+
+def _describe_block(block: Sequence["ActionRecord"]) -> str:
+    def one(rec: "ActionRecord") -> str:
+        if rec.kind == "cmd":
+            return f"the command `{rec.key}`"
+        if rec.kind in ("read", "write"):
+            return f"{rec.kind} `{rec.key}`"
+        return f"`{rec.kind}`"
+    return " then ".join(one(r) for r in block)
+
+
+def detect_action_cycle(history: Sequence["ActionRecord"],
+                        repeat_threshold: int = 3,
+                        max_cycle: int = 3) -> Optional[str]:
+    """Return a nudge if the tail of ``history`` is a cycle repeating with no new result.
+
+    Scans for the shortest cycle length ``L`` in ``1..max_cycle`` whose trailing
+    block repeats at least ``repeat_threshold`` times *including its result
+    fingerprint*. Requiring the result to be identical is what keeps the
+    legitimate ``edit -> test -> edit -> test`` loop (whose test output changes
+    as the code changes) from tripping the detector, while still catching the
+    ``ls / ls / ls`` and ``A / B / A / B`` stalls that make small models loop.
+
+    Pure function of ``history`` — no wall-clock, no randomness — so the proxy
+    path (which reconstructs history from the transcript on every request) is
+    deterministic.
+    """
+    n = len(history)
+    for length in range(1, max_cycle + 1):
+        if n < length * repeat_threshold:
+            continue
+        reps = _trailing_cycle_repeats(history, length)
+        if reps >= repeat_threshold:
+            what = _describe_block(history[-length:])
+            if length == 1:
+                return (f"You have repeated {what} {reps} times and gotten the same "
+                        "result each time — this is not making progress. Take a "
+                        "different action or change your approach.")
+            return (f"You are repeating the same cycle ({what}) with no new results. "
+                    "Break the loop and try a different approach.")
+    return None
+
+
+# Detectors take (history, repeat_threshold) and return a nudge string or None.
+# Kept as a pluggable tuple so the harness can compose its own signal set later
+# without the engine hard-coding any single policy.
+_DEFAULT_DETECTORS: tuple[Callable[..., Optional[str]], ...] = (detect_action_cycle,)
+
 
 class ProjectionControlState:
-    """Small persistent operational memory for projection-mode recovery.
+    """Structural loop detector for the projection agent.
 
-    Learns from repeated tool failures (e.g., `python` unavailable, reading dirs as files)
-    and provides concise reminders in the next turn's compact context.
+    Maintains an append-only history of executed actions (outside the model
+    context) and, on :meth:`render`, runs each detector to surface a short,
+    generic nudge when the agent is stuck in a cycle. It holds *no* hard-coded
+    knowledge of the sandbox: the only signal it uses is "the same action
+    produced the same result again", which holds regardless of OS, language, or
+    toolchain.
     """
 
-    def __init__(self) -> None:
-        self._facts: dict[str, str] = {}
-        self._error_counts: dict[str, int] = {}
+    def __init__(self, repeat_threshold: int = 3,
+                 detectors: Optional[Sequence[Callable[..., Optional[str]]]] = None) -> None:
+        self._history: list[ActionRecord] = []
+        self._repeat_threshold = repeat_threshold
+        self._detectors: tuple[Callable[..., Optional[str]], ...] = (
+            tuple(detectors) if detectors is not None else _DEFAULT_DETECTORS
+        )
 
-    def _remember(self, key: str, text: str) -> None:
-        self._facts[key] = text
-
-    def _bump_error(self, signature: str) -> int:
-        nxt = self._error_counts.get(signature, 0) + 1
-        self._error_counts[signature] = nxt
-        return nxt
+    @property
+    def history(self) -> tuple["ActionRecord", ...]:
+        """Read-only view of the full action history (for harness logging/inspection)."""
+        return tuple(self._history)
 
     def observe(self, tool_name: str, tool_input: dict, result_text: str) -> None:
-        lower = (result_text or "").lower()
-
-        if tool_name == "run_command":
-            cmd = str(tool_input.get("command", ""))
-            if "python: command not found" in lower:
-                self._remember("python_bin", "Use `python3` (not `python`) in this sandbox.")
-
-            if "exit=0" in lower and "python3" in cmd:
-                self._remember("python_bin_confirmed", "`python3` works here; keep using it for test/validation commands.")
-
-        if tool_name == "read_file":
-            if "is a directory" in lower:
-                self._remember(
-                    "read_file_directory",
-                    "`read_file` expects a file path; use `run_command` (`ls`/`find`) for directory discovery.",
-                )
-
-            if "not found" in lower:
-                seen = self._bump_error("read_file:not_found")
-                if seen >= 2:
-                    self._remember(
-                        "path_resolution",
-                        "When paths fail, list files first (`ls`, `find . -maxdepth 3 -type f`) then read exact file paths.",
-                    )
-
-        if "tool error" in lower:
-            seen = self._bump_error(f"tool_error:{tool_name}")
-            if seen >= 2:
-                self._remember(
-                    f"repeat_{tool_name}",
-                    f"Repeated {tool_name} errors detected; change strategy before retrying the same call.",
-                )
+        """Record one executed tool call. Tools not tracked for cycles are ignored."""
+        kind = _ACTION_KIND.get((tool_name or "").lower())
+        if kind is None:
+            return
+        self._history.append(ActionRecord(
+            kind,
+            _action_identity(kind, tool_input or {}),
+            _result_fingerprint(result_text),
+        ))
 
     def render(self) -> str:
-        if not self._facts:
+        """Join active detector nudges into the ``<operational_memory>`` body."""
+        hints: list[str] = []
+        for detector in self._detectors:
+            hint = detector(self._history, self._repeat_threshold)
+            if hint and hint not in hints:
+                hints.append(hint)
+        if not hints:
             return "(none yet)"
-        return "\n".join(f"- {item}" for item in self._facts.values())
+        return "\n".join(f"- {h}" for h in hints)
 
 
 # ===========================================================================
@@ -465,10 +569,10 @@ def build_world_from_messages(
 ) -> tuple["WorldCache", "ProjectionControlState", list[tuple[dict, dict]]]:
     """Reconstruct (world, control, pairs) from a Claude Code message history.
 
-    ``control`` learns from *every* observation. ``world`` holds every
-    observation except the most recent one — that final pair is returned
-    separately so the caller can present it verbatim as the live stimulus
-    (preserving Claude Code's real tool ids/names).
+    ``control`` records *every* observation for structural cycle detection.
+    ``world`` holds every observation except the most recent one — that final
+    pair is returned separately so the caller can present it verbatim as the
+    live stimulus (preserving Claude Code's real tool ids/names).
     """
     pairs = _extract_pairs(messages)
     world = WorldCache(token_budget=8000)
