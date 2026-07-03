@@ -65,6 +65,99 @@ def _is_messages_path(path):
     return path.split("?")[0].rstrip("/").endswith("/v1/messages")
 
 
+def _sse_event(event_type, data_obj):
+    """Encode one Anthropic-style Server-Sent Event frame."""
+    return f"event: {event_type}\ndata: {json.dumps(data_obj)}\n\n".encode()
+
+
+def _message_to_sse(msg):
+    """Reconstruct an Anthropic Messages SSE stream from a buffered response.
+
+    Claude Code's interactive TUI sends ``stream: true`` and parses the reply as
+    Server-Sent Events. We force non-streaming *upstream* (so the full response
+    can be buffered and logged), then re-emit that single response as the SSE
+    event sequence the client expects:
+
+        message_start
+        (content_block_start / content_block_delta / content_block_stop) * N
+        message_delta
+        message_stop
+
+    Only text and tool_use blocks are reconstructed precisely (they cover
+    coding-agent responses); any other block type is passed through in its
+    ``content_block_start`` frame. An upstream error object is surfaced as an
+    SSE ``error`` event so the client shows the real message instead of a
+    generic "malformed response".
+    """
+    if not isinstance(msg, dict) or msg.get("type") == "error":
+        err = msg if isinstance(msg, dict) else {
+            "type": "error",
+            "error": {"type": "api_error", "message": "empty upstream response"},
+        }
+        return _sse_event("error", err)
+
+    content = msg.get("content") or []
+    usage = msg.get("usage") or {}
+
+    out = bytearray()
+    out += _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg.get("id", "msg_proxy"),
+            "type": "message",
+            "role": msg.get("role", "assistant"),
+            "model": msg.get("model", ""),
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": usage.get("input_tokens", 0),
+                      "output_tokens": 0},
+        },
+    })
+
+    for i, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "text", "text": ""}})
+            out += _sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": i,
+                "delta": {"type": "text_delta", "text": block.get("text", "")}})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+        elif btype == "tool_use":
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "tool_use", "id": block.get("id", ""),
+                                  "name": block.get("name", ""), "input": {}}})
+            out += _sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": i,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": json.dumps(block.get("input", {}))}})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+        else:
+            # thinking / redacted_thinking / unknown: pass the whole block
+            # through in the start frame so the client still receives it.
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": block})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+
+    out += _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": msg.get("stop_reason"),
+                  "stop_sequence": msg.get("stop_sequence")},
+        "usage": {"output_tokens": usage.get("output_tokens", 0)},
+    })
+    out += _sse_event("message_stop", {"type": "message_stop"})
+    return bytes(out)
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[proxy] {self.command} {self.path}", flush=True)
@@ -99,6 +192,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             original_msg_count = len(payload.get("messages") or [])
             original_system_len = len(str(payload.get("system") or ""))
             original_tools_count = len(payload.get("tools") or [])
+            # Whether the CLIENT asked for a streaming (SSE) response. We always
+            # force non-streaming upstream (below) to buffer + log the full
+            # reply, then re-emit it as SSE if the client wanted a stream.
+            client_wants_stream = bool(payload.get("stream"))
 
             # 1. Apply projection (rebuild compact, correctly-paired context).
             # Baseline A/B (SYNAXI_DISABLE_PROJECTION=1): forward the
@@ -143,6 +240,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "request": payload,
                 "response": resp_json,
             })
+
+            # Re-emit as SSE when the client requested a stream (interactive
+            # Claude Code TUI); otherwise return the buffered JSON (claude -p,
+            # benchmark harness).
+            if client_wants_stream:
+                out_body = _message_to_sse(resp_json)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(len(out_body)))
+                self.end_headers()
+                self.wfile.write(out_body)
+                return
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
