@@ -94,9 +94,11 @@ PROJECTION_SYSTEM = (
 )
 
 
-# Tool names worth keeping in the projected request. Everything else Claude Code
-# ships (~60 schemas) is stripped to save context. Discovery (ls/grep/find) is
-# funnelled through Bash so its output lands in the WorldCache and is replayed.
+# Optional controlled tool vocabulary for benchmarking. Not applied in normal
+# use — ``project_payload`` keeps every tool the client defines unless a caller
+# explicitly passes ``keep_tools`` (e.g. to constrain a small local model to a
+# fixed set). Discovery (ls/grep/find) is funnelled through Bash so its output
+# lands in the WorldCache and is replayed.
 DEFAULT_KEEP_TOOLS = {
     # Claude Code native tools
     "Read", "Write", "Edit", "Bash",
@@ -562,18 +564,31 @@ def _build_system(orig_system, preserve_claude_identity: bool,
     return [identity, contract]
 
 
-def _filter_tools(tools: Optional[list], keep: set,
-                  cache_last: bool = False) -> Optional[list]:
+def _prepare_tools(tools: Optional[list], keep: Optional[set] = None,
+                   cache_last: bool = False) -> Optional[list]:
+    """Normalize the tool block for the projected request.
+
+    By default (``keep is None``) every tool the client defined is kept.
+    Projection compresses the growing *message history*, not the fixed tool
+    list, so there is no reason to take tools away from the model in normal
+    use — doing so silently breaks Grep/Glob/TodoWrite/WebFetch/MCP servers.
+    Pass an explicit ``keep`` set to trim the vocabulary for a controlled
+    benchmark (e.g. a small local model); if nothing matches we still keep the
+    full list rather than emit an arbitrary subset.
+
+    Independent of filtering we always strip inherited ``cache_control`` markers
+    and, when ``cache_last`` is set (native Claude path), mark the final tool so
+    the whole byte-stable tool block sits behind exactly one cache breakpoint.
+    """
     if not tools:
         return tools
-    filtered = [t for t in tools if isinstance(t, dict) and t.get("name") in keep]
-    filtered = filtered or tools[:4]
-    # Strip inherited breakpoints, then (native path) cache the entire tool
-    # block via a single marker on the last definition — tools never change.
-    filtered = [_strip_cc(tool) for tool in filtered]
-    if cache_last and filtered:
-        filtered[-1] = _with_cc(filtered[-1])
-    return filtered
+    if keep is not None:
+        selected = [t for t in tools if isinstance(t, dict) and t.get("name") in keep]
+        tools = selected or tools
+    prepared = [_strip_cc(tool) for tool in tools]
+    if cache_last and prepared:
+        prepared[-1] = _with_cc(prepared[-1])
+    return prepared
 
 
 def project_payload(payload: dict, keep_tools: Optional[set] = None,
@@ -583,7 +598,10 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
 
     Steps:
       1. Replace Claude Code's ~10 KB system prompt with :data:`PROJECTION_SYSTEM`.
-      2. Strip the tool list down to :data:`DEFAULT_KEEP_TOOLS`.
+      2. Normalize the tool block for prompt caching, keeping *every* tool the
+         client defined. Pass ``keep_tools`` to trim the vocabulary for a
+         controlled benchmark (see :data:`DEFAULT_KEEP_TOOLS`); normal use keeps
+         all tools so Grep/Glob/TodoWrite/MCP servers keep working.
       3. Rebuild the messages array from the durable world (every prior file
          read / command run as a native, correctly-paired tool exchange) plus
          an ``<operational_memory>`` block and the most recent live tool pair.
@@ -593,7 +611,10 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
     models looping. The model's response uses Claude Code tool names
     (``Read`` / ``Bash`` / ``Write`` / ``Edit``) so Claude Code can execute it.
     """
-    keep = keep_tools if keep_tools is not None else DEFAULT_KEEP_TOOLS
+    # ``keep_tools=None`` (the default) keeps every tool the client defined;
+    # projection's win is compressing the growing history, not the fixed tool
+    # list, so normal use should never take tools away from the model.
+    keep = keep_tools
     messages = payload.get("messages") or []
 
     # Anthropic prompt caching only helps the native Claude path; default it
@@ -601,18 +622,19 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
     if cache_prefix is None:
         cache_prefix = preserve_claude_identity
 
-    # 1 + 2: always swap the system prompt and shrink the tool list.
+    # 1 + 2: swap the system prompt and normalize the tool block (keeping every
+    # tool the client defined by default — see ``keep`` below).
     payload["system"] = _build_system(payload.get("system"),
                                       preserve_claude_identity,
                                       cache_prefix=cache_prefix)
-    filtered_tools = _filter_tools(payload.get("tools"), keep,
-                                   cache_last=cache_prefix)
-    if filtered_tools:
-        payload["tools"] = filtered_tools
+    prepared_tools = _prepare_tools(payload.get("tools"), keep=keep,
+                                    cache_last=cache_prefix)
+    if prepared_tools:
+        payload["tools"] = prepared_tools
     else:
         # Never emit ``"tools": null``. The interactive Claude Code TUI fires
         # lightweight requests (conversation title, topic detection, quota
-        # checks) that carry no tools; ``_filter_tools`` returns ``None`` for
+        # checks) that carry no tools; ``_prepare_tools`` returns ``None`` for
         # those and assigning it would add ``"tools": null`` — which Anthropic
         # rejects with "tools: Input should be a valid array". Drop the key
         # (and any now-orphaned ``tool_choice``) so the request stays valid.
