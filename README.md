@@ -13,8 +13,10 @@ It can drive two execution paths against the same projection engine:
    executes tools itself, against a sandbox observed through a **FUSE**
    filesystem.
 2. **Claude Code via a MITM proxy** (`_proxy_server.py`) — Claude Code owns the
-   loop; a local proxy projects every request before it reaches a local Ollama
-   model.
+   loop; a local proxy projects the coding **worker** subagent's requests before
+   they reach the upstream model (local Ollama *or* real Claude). Interactive
+   chat and UI requests pass through untouched — see
+   [Two agents](#two-agents-a-chat-orchestrator-in-front-of-a-projected-worker).
 
 ---
 
@@ -186,6 +188,52 @@ prompt is used unchanged.
 
 ---
 
+## Two agents: a chat orchestrator in front of a projected worker
+
+Projection only helps an agent that *accumulates* a long transcript.
+Interactive chat turns, `/init`, autocomplete, and MCP sidecar calls don't need
+it — projecting them would strip context the UI expects. So `wrap claude`
+installs **two** Claude Code subagents and projects only one of them:
+
+| Agent | Tools | Proxy treatment |
+| ----- | ----- | --------------- |
+| **`synaxi-chat`** | `Agent(synaxi-worker)` only | **passthrough** — a tool-free orchestrator that turns vague requests into crisp goals and delegates every coding task to the worker |
+| **`synaxi-worker`** | `Read` `Write` `Edit` `Bash` `Grep` `Glob` | **projected** — the autonomous coder whose ever-growing context is what projection shrinks to constant space |
+
+### How the proxy tells them apart: a sentinel, not a fingerprint
+
+A custom subagent's markdown body **is** its API `system` prompt, verbatim (a
+documented Claude Code behaviour). So `synaxi-worker`'s prompt carries a fixed
+sentinel — `WORKER_SENTINEL = "SYNAXI-PROJECTION-WORKER"` — and the proxy
+projects a request iff its `system` text contains it:
+
+```python
+is_worker  = is_worker_payload(payload)          # substring match on system text
+do_project = (not DISABLE_PROJECTION) and (PROJECT_ALL or is_worker)
+```
+
+This is a deterministic *stamp we control*, not a heuristic that guesses from
+prompt shape — so it can't drift as Claude Code's own prompts change between
+versions. Every logged request records `is_worker` / `projected` in its
+`projection_meta`, so the gate is auditable after the fact.
+
+- `SYNAXI_PROJECT_ALL=1` restores the old "project every request" behaviour
+  (used to A/B a small local model with no custom agent).
+- `SYNAXI_DISABLE_PROJECTION=1` forwards everything untouched (pure MITM logger).
+
+### Why split the roles
+
+A projected context is a *lossy, reconstructed* view — right for a headless
+coder that only needs its durable observations, wrong for a conversation where
+the user's exact phrasing matters. Splitting the roles lets each half get the
+treatment it needs: the chat agent keeps full fidelity for talking to you; the
+worker runs on constant-space projected context so a small or local model can
+carry a long task without drowning or looping. `wrap` installs both agents into
+the Claude Code agents dir for the session and removes them on exit (see
+[What wrapping does](#run)).
+
+---
+
 ## How the caches use FUSE
 
 Projection decides *how observations are compressed back into context*. **FUSE
@@ -278,11 +326,12 @@ non-streaming for logging, injects auth, and forwards.
 
 | File                    | Responsibility                                              |
 | ----------------------- | ----------------------------------------------------------- |
-| `projection.py`         | **Canonical projection engine** (world, memory, context).   |
+| `projection.py`         | **Canonical projection engine** (world, memory, context, worker sentinel gate). |
 | `benchmark.py`          | In-process agent loop, `FileSystemTracker` (FUSE), scoring.  |
-| `_proxy_server.py`      | MITM proxy: projects each request, forwards, logs JSONL.     |
+| `_proxy_server.py`      | MITM proxy: gates + projects each request, forwards, logs JSONL. |
 | `proxy.py`              | Start/stop the proxy; `apply_projection()` entrypoint.       |
-| `wrapper.py` / `cli.py` | `synaxi-projection wrap claude …` Headroom-style wrapper.    |
+| `wrapper.py` / `cli.py` | `synaxi-projection wrap claude …` wrapper; installs/removes agents. |
+| `agents/*.md`           | Bundled subagents: `synaxi-chat` (orchestrator) + `synaxi-worker` (projected). |
 | `sandbox.py`            | `TaskSandbox` temp working dirs + pytest/script runners.     |
 
 **Benchmarking & analysis (`scripts/`)**
@@ -322,10 +371,17 @@ python -m synaxi_projection.proxy --upstream http://127.0.0.1:11434 --model gemm
 synaxi-projection-benchmark --claude-code --model gemma4:latest --fs-tracker fuse
 ```
 
-**Wrap the Claude Code TUI (projection-only):**
+**Wrap the Claude Code TUI:**
 
 ```bash
+# Against real Claude (uses your Claude subscription; `claude` auths itself).
+# Launches the synaxi-chat orchestrator, which delegates coding to the
+# projected synaxi-worker subagent.
+synaxi-projection wrap claude
+
+# Against a local Ollama model instead.
 synaxi-projection wrap claude --upstream http://127.0.0.1:11434 --model gemma4:latest
+
 synaxi-projection status
 synaxi-projection doctor
 synaxi-projection unwrap claude
@@ -336,8 +392,19 @@ What wrapping does:
 1. Starts the projection proxy on `http://127.0.0.1:<port>`.
 2. Writes `ANTHROPIC_BASE_URL` into `.claude/settings.local.json` so every
    Claude Code session (including daemon-spawned workers) routes through it.
-3. Launches `claude` with the env var set; restores settings and stops the proxy
-   on exit.
+3. Installs the bundled `synaxi-chat` and `synaxi-worker` subagents into the
+   Claude Code agents dir (honouring `CLAUDE_CONFIG_DIR`), saving any
+   same-named agents first.
+4. Launches `claude --agent synaxi-chat` with the env var set. Only the worker's
+   requests get projected (via the sentinel gate above).
+5. On exit — even after a crash — restores settings, removes the installed
+   agents (or restores the saved originals), and stops the proxy.
+
+Flags: `--agent <name>` launches a different session agent (default
+`synaxi-chat`); `--no-agent` launches plain Claude Code with no agent; both are
+only honoured when the agent definition exists on disk. Any flag the wrapper
+doesn't recognise (e.g. `--dangerously-skip-permissions`) is forwarded verbatim
+to the `claude` binary.
 
 > Ensure `~/.local/bin` is earlier in `PATH` than the original Claude install.
 
