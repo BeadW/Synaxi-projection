@@ -1,25 +1,5 @@
 # synaxi-projection
 
-Projection-only context tooling, separated from `synaxi-predict`.
-
-This repository is the runtime + benchmark harness used to evaluate **context
-projection**: shrinking a coding agent's ever-growing transcript down to a
-small, *constant-space* context that a local model can actually run, **without
-losing the agent's working memory**.
-
-It can drive two execution paths against the same projection engine:
-
-1. **In-process agent loop** (`benchmark.py`) — the harness owns the loop and
-   executes tools itself, against a sandbox observed through a **FUSE**
-   filesystem.
-2. **Claude Code via a MITM proxy** (`_proxy_server.py`) — Claude Code owns the
-   loop; a local proxy projects the coding **worker** subagent's requests before
-   they reach the upstream model (local Ollama *or* real Claude). Interactive
-   chat and UI requests pass through untouched — see
-   [Two agents](#two-agents-a-chat-orchestrator-in-front-of-a-projected-worker).
-
----
-
 ## Quick Start: Use with Claude Code
 
 ```bash
@@ -43,6 +23,26 @@ synaxi-projection unwrap claude
 ```
 
 See [Install](#install) and [Run](#run) below for more configuration options.
+
+---
+
+Projection-only context tooling, separated from `synaxi-predict`.
+
+This repository is the runtime + benchmark harness used to evaluate **context
+projection**: shrinking a coding agent's ever-growing transcript down to a
+small, *constant-space* context that a local model can actually run, **without
+losing the agent's working memory**.
+
+It can drive two execution paths against the same projection engine:
+
+1. **In-process agent loop** (`benchmark.py`) — the harness owns the loop and
+   executes tools itself, against a sandbox observed through a **FUSE**
+   filesystem.
+2. **Claude Code via a MITM proxy** (`_proxy_server.py`) — Claude Code owns the
+   loop; a local proxy projects the coding **worker** subagent's requests before
+   they reach the upstream model (local Ollama *or* real Claude). Interactive
+   chat and UI requests pass through untouched — see
+   [Two agents](#two-agents-a-chat-orchestrator-in-front-of-a-projected-worker).
 
 ---
 
