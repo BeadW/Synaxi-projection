@@ -18,6 +18,74 @@ It can drive two execution paths against the same projection engine:
 
 ---
 
+## Quick start
+
+Projection runs as a small local proxy between **Claude Code** (the `claude`
+CLI) and whichever model serves it. You use Claude Code exactly as you normally
+would; the proxy transparently rewrites each request into a compact,
+constant-space context before it goes upstream.
+
+**Prerequisites**
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and on
+  your `PATH` — check with `which claude`.
+- This package installed:
+
+  ```bash
+  pip install -e .
+  ```
+
+### 1. Your normal Claude session — with projection
+
+Run against your real Claude subscription and the usual Claude models; the only
+difference is that projection shrinks the context on the way out (and adds
+prompt caching). `claude` authenticates itself, so **do not** set
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`.
+
+```bash
+synaxi-projection wrap claude
+```
+
+That's the whole thing. The proxy starts pointed at `https://api.anthropic.com`
+(the default), every Claude Code request is projected, and your normal `claude`
+session launches. Anything after `claude` is passed straight through to Claude
+Code. When you exit, the proxy stops and your settings are restored.
+
+### 2. A fully local session (Ollama) — with projection
+
+Point the same wrapper at a local [Ollama](https://ollama.com) server (v0.14.0+,
+which speaks the Anthropic Messages API natively). This is what makes a small
+model usable as a coding agent at all: projection keeps the transcript from
+overrunning its context window.
+
+```bash
+# once: pull a coding model
+ollama pull qwen2.5-coder:7b
+
+# route Claude Code through projection → Ollama
+synaxi-projection wrap claude \
+  --upstream http://127.0.0.1:11434 \
+  --model qwen2.5-coder:7b
+```
+
+The wrapper supplies a throwaway auth token (Ollama ignores it) and forwards
+your chosen `--model` upstream.
+
+### Manage the wrapper
+
+```bash
+synaxi-projection status          # wrapped? proxy up?
+synaxi-projection doctor          # health checks (claude on PATH, proxy reachable, …)
+synaxi-projection unwrap claude   # restore .claude/settings.local.json and stop the proxy
+```
+
+> The wrapper writes `ANTHROPIC_BASE_URL` into `.claude/settings.local.json` so
+> every Claude Code session (including daemon-spawned workers) routes through the
+> proxy, then restores it on exit. Keep `~/.local/bin` earlier on your `PATH`
+> than any other `claude` install.
+
+---
+
 ## Results
 
 On a 31-task coding suite (10×T2, 12×T3, 9×T4), driven through the **same**
@@ -289,17 +357,21 @@ non-streaming for logging, injects auth, and forwards.
 
 ---
 
-## Install
+## Benchmarking
+
+> Interactive use is covered in **[Quick start](#quick-start)**. This section is
+> the evaluation harness that produces the numbers above — it drives the same
+> projection engine through a scored task suite.
+
+FUSE observation is optional and needs macFUSE plus `fusepy` (see
+[How the caches use FUSE](#how-the-caches-use-fuse)); without them the tracker
+degrades to `snapshot` mode:
 
 ```bash
-pip install -e .
-# optional, for real FUSE observation (plus system macFUSE):
 pip install fusepy
 ```
 
-## Run
-
-**Benchmark, in-process loop (local Ollama, FUSE-observed):**
+**In-process loop (local Ollama, FUSE-observed):**
 
 ```bash
 synaxi-projection-benchmark \
@@ -307,7 +379,7 @@ synaxi-projection-benchmark \
   --projection --fs-tracker fuse --require-fuse
 ```
 
-**Benchmark through Claude Code + the projection proxy:**
+**Through Claude Code + the projection proxy:**
 
 ```bash
 # start the proxy pointed at Ollama
@@ -315,25 +387,6 @@ python -m synaxi_projection.proxy --upstream http://127.0.0.1:11434 --model gemm
 # run benchmark tasks through `claude -p` via the proxy, with FUSE tracking
 synaxi-projection-benchmark --claude-code --model gemma4:latest --fs-tracker fuse
 ```
-
-**Wrap the Claude Code TUI (projection-only):**
-
-```bash
-synaxi-projection wrap claude --upstream http://127.0.0.1:11434 --model gemma4:latest
-synaxi-projection status
-synaxi-projection doctor
-synaxi-projection unwrap claude
-```
-
-What wrapping does:
-
-1. Starts the projection proxy on `http://127.0.0.1:<port>`.
-2. Writes `ANTHROPIC_BASE_URL` into `.claude/settings.local.json` so every
-   Claude Code session (including daemon-spawned workers) routes through it.
-3. Launches `claude` with the env var set; restores settings and stops the proxy
-   on exit.
-
-> Ensure `~/.local/bin` is earlier in `PATH` than the original Claude install.
 
 ## Full benchmark suite
 
