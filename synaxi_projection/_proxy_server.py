@@ -3,10 +3,12 @@ synaxi_projection._proxy_server
 MITM proxy between Claude Code and Ollama (or Anthropic).
 
 Ollama speaks the Anthropic Messages API natively (v0.14.0+), so no format
-translation is needed. This proxy's whole job is projection: on every
-/v1/messages request it replaces Claude Code's enormous accumulated context
-with a compact, correctly-paired one rebuilt by
-synaxi_projection.projection.project_payload. It then:
+translation is needed. This proxy's whole job is projection: on each
+/v1/messages request from the Synaxi *worker* subagent it replaces Claude
+Code's enormous accumulated context with a compact, correctly-paired one
+rebuilt by synaxi_projection.projection.project_payload. Requests that are not
+the worker (interactive chat, /init, the tool-free chat orchestrator, and
+title / topic / quota sidecars) are forwarded untouched. It then:
 
   1. Rewrites the model name (claude-* -> the local Ollama tag)
   2. Forces non-streaming so the full response can be buffered + logged
@@ -36,16 +38,21 @@ from pathlib import Path
 # standalone script (so sys.path[0] is this directory, not the repo root);
 # fall back to inserting the repo root so the package import resolves.
 try:
-    from synaxi_projection.projection import project_payload
+    from synaxi_projection.projection import project_payload, is_worker_payload
 except ImportError:  # pragma: no cover - script-mode bootstrap
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from synaxi_projection.projection import project_payload
+    from synaxi_projection.projection import project_payload, is_worker_payload
 
 UPSTREAM = os.environ.get("SYNAXI_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 PORT = int(os.environ.get("SYNAXI_PORT", "8787"))
 MODEL = os.environ.get("SYNAXI_MODEL", "")
 IS_OLLAMA = "api.anthropic.com" not in UPSTREAM
 DISABLE_PROJECTION = os.environ.get("SYNAXI_DISABLE_PROJECTION", "").strip().lower() not in ("", "0", "false", "no")
+# By default projection is applied ONLY to the Synaxi worker subagent (detected
+# by the sentinel its system prompt carries). Set SYNAXI_PROJECT_ALL=1 to
+# project every /v1/messages request instead — the pre-subagent behaviour, kept
+# for benchmarking / A-B against a small local model with no custom agent.
+PROJECT_ALL = os.environ.get("SYNAXI_PROJECT_ALL", "").strip().lower() not in ("", "0", "false", "no")
 
 LOG_DIR = Path(os.environ.get("SYNAXI_LOG_DIR", Path.home() / ".synaxi-projection" / "conversations"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,6 +70,127 @@ def _log(entry):
 def _is_messages_path(path):
     """True for /v1/messages, tolerating trailing slash and ?beta=true etc."""
     return path.split("?")[0].rstrip("/").endswith("/v1/messages")
+
+
+def _sse_event(event_type, data_obj):
+    """Encode one Anthropic-style Server-Sent Event frame."""
+    return f"event: {event_type}\ndata: {json.dumps(data_obj)}\n\n".encode()
+
+
+def _message_to_sse(msg):
+    """Reconstruct an Anthropic Messages SSE stream from a buffered response.
+
+    Claude Code's interactive TUI sends ``stream: true`` and parses the reply as
+    Server-Sent Events. We force non-streaming *upstream* (so the full response
+    can be buffered and logged), then re-emit that single response as the SSE
+    event sequence the client expects:
+
+        message_start
+        (content_block_start / content_block_delta / content_block_stop) * N
+        message_delta
+        message_stop
+
+    Only text and tool_use blocks are reconstructed precisely (they cover
+    coding-agent responses); any other block type is passed through in its
+    ``content_block_start`` frame. An upstream error object is surfaced as an
+    SSE ``error`` event so the client shows the real message instead of a
+    generic "malformed response".
+    """
+    if not isinstance(msg, dict) or msg.get("type") == "error":
+        err = msg if isinstance(msg, dict) else {
+            "type": "error",
+            "error": {"type": "api_error", "message": "empty upstream response"},
+        }
+        return _sse_event("error", err)
+
+    content = msg.get("content") or []
+    usage = msg.get("usage") or {}
+
+    out = bytearray()
+    out += _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg.get("id", "msg_proxy"),
+            "type": "message",
+            "role": msg.get("role", "assistant"),
+            "model": msg.get("model", ""),
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": usage.get("input_tokens", 0),
+                      "output_tokens": 0},
+        },
+    })
+
+    for i, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "text", "text": ""}})
+            out += _sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": i,
+                "delta": {"type": "text_delta", "text": block.get("text", "")}})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+        elif btype == "tool_use":
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "tool_use", "id": block.get("id", ""),
+                                  "name": block.get("name", ""), "input": {}}})
+            out += _sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": i,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": json.dumps(block.get("input", {}))}})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+        elif btype == "thinking":
+            # Extended-thinking block. Claude Code builds the block from an
+            # empty start frame plus DELTAS, ignoring any thinking/signature
+            # placed inline in content_block_start. With adaptive thinking the
+            # model often returns empty thinking text but a long ``signature``
+            # (Anthropic verifies the block by that signature on the next turn).
+            # If we don't replay the signature via a ``signature_delta`` the
+            # client reconstructs {"thinking":"","signature":""}, echoes that
+            # back next turn, and Anthropic rejects it with "each thinking block
+            # must contain thinking" — surfaced to the user as an empty/HTTP-200
+            # error. So stream it the way the client expects.
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "thinking", "thinking": ""}})
+            thinking_text = block.get("thinking") or ""
+            if thinking_text:
+                out += _sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": i,
+                    "delta": {"type": "thinking_delta", "thinking": thinking_text}})
+            signature = block.get("signature") or ""
+            if signature:
+                out += _sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": i,
+                    "delta": {"type": "signature_delta", "signature": signature}})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+        else:
+            # redacted_thinking / unknown: opaque to us (a redacted_thinking
+            # block carries its payload in ``data``, not deltas), so pass the
+            # whole block through in the start frame — the client stores it
+            # verbatim and can return it unchanged.
+            out += _sse_event("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": block})
+            out += _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i})
+
+    out += _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": msg.get("stop_reason"),
+                  "stop_sequence": msg.get("stop_sequence")},
+        "usage": {"output_tokens": usage.get("output_tokens", 0)},
+    })
+    out += _sse_event("message_stop", {"type": "message_stop"})
+    return bytes(out)
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -99,12 +227,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             original_msg_count = len(payload.get("messages") or [])
             original_system_len = len(str(payload.get("system") or ""))
             original_tools_count = len(payload.get("tools") or [])
+            # Whether the CLIENT asked for a streaming (SSE) response. We always
+            # force non-streaming upstream (below) to buffer + log the full
+            # reply, then re-emit it as SSE if the client wanted a stream.
+            client_wants_stream = bool(payload.get("stream"))
 
             # 1. Apply projection (rebuild compact, correctly-paired context).
-            # Baseline A/B (SYNAXI_DISABLE_PROJECTION=1): forward the
-            # full, growing payload untouched so projection can be
-            # compared against no-projection on the same model.
-            if not DISABLE_PROJECTION:
+            # Gate: project ONLY the Synaxi worker subagent's turns, detected by
+            # the sentinel its system prompt carries (see projection.py). The
+            # interactive chat orchestrator, /init, and lightweight sidecars
+            # (title / topic / quota) carry no sentinel and pass through
+            # untouched — which is also what keeps conversational turns intact.
+            #   * SYNAXI_DISABLE_PROJECTION=1 -> forward everything untouched
+            #     (baseline A/B: projection vs no-projection on the same model).
+            #   * SYNAXI_PROJECT_ALL=1        -> project every request
+            #     (pre-subagent behaviour, for benchmarking a small local model).
+            is_worker = is_worker_payload(payload)
+            do_project = (not DISABLE_PROJECTION) and (PROJECT_ALL or is_worker)
+            if do_project:
                 payload = project_payload(payload, preserve_claude_identity=not IS_OLLAMA)
 
             # 2. Rewrite the model name when talking to Ollama.
@@ -133,6 +273,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "original_msg_count": original_msg_count,
                 "projected_msg_count": len(projected_msgs),
                 "projection_meta": {
+                    "is_worker": is_worker,
+                    "projected": do_project,
                     "original_system_len": original_system_len,
                     "original_tools_count": original_tools_count,
                     "projected_system_len": len(str(payload.get("system") or "")),
@@ -143,6 +285,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "request": payload,
                 "response": resp_json,
             })
+
+            # Re-emit as SSE when the client requested a stream (interactive
+            # Claude Code TUI); otherwise return the buffered JSON (claude -p,
+            # benchmark harness).
+            if client_wants_stream:
+                out_body = _message_to_sse(resp_json)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(len(out_body)))
+                self.end_headers()
+                self.wfile.write(out_body)
+                return
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

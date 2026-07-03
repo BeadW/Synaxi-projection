@@ -23,7 +23,7 @@ prompt + ~60 tool schemas + every prior turn) to a small local model, we
 rebuild a *constant-space* context from the durable facts the agent has
 observed — the files it has read/written and the commands it has run — and
 re-emit them as native, correctly-paired ``tool_use`` / ``tool_result``
-messages, plus a small ``<operational_memory>`` block of lessons learned.
+messages, plus a small ``<system-reminder>`` block of lessons learned.
 
 Why native tool pairs (not a prose summary)
 -------------------------------------------
@@ -66,6 +66,9 @@ __all__ = [
     "PROJECTION_SYSTEM",
     "CLAUDE_CODE_IDENTITY",
     "DEFAULT_KEEP_TOOLS",
+    "WORKER_SENTINEL",
+    "system_text",
+    "is_worker_payload",
 ]
 
 
@@ -94,9 +97,11 @@ PROJECTION_SYSTEM = (
 )
 
 
-# Tool names worth keeping in the projected request. Everything else Claude Code
-# ships (~60 schemas) is stripped to save context. Discovery (ls/grep/find) is
-# funnelled through Bash so its output lands in the WorldCache and is replayed.
+# Optional controlled tool vocabulary for benchmarking. Not applied in normal
+# use — ``project_payload`` keeps every tool the client defines unless a caller
+# explicitly passes ``keep_tools`` (e.g. to constrain a small local model to a
+# fixed set). Discovery (ls/grep/find) is funnelled through Bash so its output
+# lands in the WorldCache and is replayed.
 DEFAULT_KEEP_TOOLS = {
     # Claude Code native tools
     "Read", "Write", "Edit", "Bash",
@@ -301,20 +306,33 @@ def generate_context(
     cmd_name, cmd_key = dia["cmd"]
 
     cwd_note = f"\n\nWorking directory: {cwd}" if cwd else ""
+    # The projected operational memory and runtime notices are our OWN trusted,
+    # in-band context — the agent's distilled lessons from its earlier tool
+    # results, which is the core of what projection carries forward. Deliver
+    # them as <system-reminder> blocks: that is Claude Code's own convention for
+    # injecting dynamic trusted context (todos, CLAUDE.md, safety notes) into
+    # the message stream, and the model is trained to treat it as trusted system
+    # context rather than user input. A bare <operational_memory> block with an
+    # "apply this" imperative appended after a tool_result reads exactly like a
+    # prompt-injection attempt, so a full model (the native projection worker)
+    # correctly refuses its own memory. We keep these in the volatile tail
+    # (after the cache breakpoint) so the cached world prefix stays byte-stable.
     control_note = ""
     if control_state and control_state != "(none yet)":
         control_note = (
-            "\n\n<operational_memory>\n"
+            "\n\n<system-reminder>\n"
+            "The notes below are your own operational memory, distilled from your "
+            "earlier tool results this session (not user input). Use them to avoid "
+            "repeating earlier mistakes, unless a newer tool result supersedes them:\n"
             f"{control_state}\n"
-            "</operational_memory>\n"
-            "Apply this memory when choosing tools/commands unless a newer tool result disproves it."
+            "</system-reminder>"
         )
     notice = ""
     if runtime_notice:
         notice = (
-            "\n\n<runtime_reminder>\n"
+            "\n\n<system-reminder>\n"
             f"{runtime_notice}\n"
-            "</runtime_reminder>"
+            "</system-reminder>"
         )
 
     # msg[0] is the stable goal ONLY. Volatile operational memory / runtime
@@ -562,18 +580,86 @@ def _build_system(orig_system, preserve_claude_identity: bool,
     return [identity, contract]
 
 
-def _filter_tools(tools: Optional[list], keep: set,
-                  cache_last: bool = False) -> Optional[list]:
+def _prepare_tools(tools: Optional[list], keep: Optional[set] = None,
+                   cache_last: bool = False) -> Optional[list]:
+    """Normalize the tool block for the projected request.
+
+    By default (``keep is None``) every tool the client defined is kept.
+    Projection compresses the growing *message history*, not the fixed tool
+    list, so there is no reason to take tools away from the model in normal
+    use — doing so silently breaks Grep/Glob/TodoWrite/WebFetch/MCP servers.
+    Pass an explicit ``keep`` set to trim the vocabulary for a controlled
+    benchmark (e.g. a small local model); if nothing matches we still keep the
+    full list rather than emit an arbitrary subset.
+
+    Independent of filtering we always strip inherited ``cache_control`` markers
+    and, when ``cache_last`` is set (native Claude path), mark the final tool so
+    the whole byte-stable tool block sits behind exactly one cache breakpoint.
+    """
     if not tools:
         return tools
-    filtered = [t for t in tools if isinstance(t, dict) and t.get("name") in keep]
-    filtered = filtered or tools[:4]
-    # Strip inherited breakpoints, then (native path) cache the entire tool
-    # block via a single marker on the last definition — tools never change.
-    filtered = [_strip_cc(tool) for tool in filtered]
-    if cache_last and filtered:
-        filtered[-1] = _with_cc(filtered[-1])
-    return filtered
+    if keep is not None:
+        selected = [t for t in tools if isinstance(t, dict) and t.get("name") in keep]
+        tools = selected or tools
+    prepared = [_strip_cc(tool) for tool in tools]
+    if cache_last and prepared:
+        prepared[-1] = _with_cc(prepared[-1])
+    return prepared
+
+
+# ---------------------------------------------------------------------------
+# Worker-subagent detection.
+#
+# We do not fingerprint the worker heuristically — we *stamp* it. A custom
+# Claude Code subagent's markdown body becomes its API ``system`` prompt
+# verbatim (plus a few environment lines Claude Code appends), never the full
+# Claude Code system prompt. So embedding this sentinel in the body of
+# ``.claude/agents/synaxi-worker.md`` gives the proxy a deterministic,
+# version-proof marker on the wire:
+#
+#     sentinel present  -> project (this is our agentic worker)
+#     sentinel absent    -> pass through untouched (interactive chat, /init,
+#                           the chat orchestrator, title/topic/quota sidecars)
+#
+# The sentinel is only read *before* projection swaps the system prompt out, so
+# the model itself never sees it. Keep this string in sync with the agent file;
+# ``tests/test_worker_gate.py`` guards that they never drift apart.
+# ---------------------------------------------------------------------------
+WORKER_SENTINEL = "SYNAXI-PROJECTION-WORKER"
+
+
+def system_text(system) -> str:
+    """Flatten an Anthropic ``system`` field to plain text.
+
+    ``system`` may be a plain string or a list of content blocks
+    (``{"type": "text", "text": ...}``). Return the concatenated text so
+    callers can substring-search it (e.g. for :data:`WORKER_SENTINEL`).
+    """
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts = []
+        for blk in system:
+            if isinstance(blk, dict):
+                parts.append(str(blk.get("text", "")))
+            elif isinstance(blk, str):
+                parts.append(blk)
+        return "\n".join(parts)
+    return ""
+
+
+def is_worker_payload(payload: dict) -> bool:
+    """True when a request originated from the Synaxi projection worker subagent.
+
+    The worker's system prompt (its subagent markdown body) carries
+    :data:`WORKER_SENTINEL`, and Claude Code sends that body verbatim as the
+    request ``system``. Detecting it lets the proxy project *only* the worker's
+    agentic turns and forward every other request — interactive chat, ``/init``,
+    the tool-free chat orchestrator, and lightweight sidecars — unchanged.
+    """
+    if not isinstance(payload, dict):
+        return False
+    return WORKER_SENTINEL in system_text(payload.get("system"))
 
 
 def project_payload(payload: dict, keep_tools: Optional[set] = None,
@@ -583,17 +669,23 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
 
     Steps:
       1. Replace Claude Code's ~10 KB system prompt with :data:`PROJECTION_SYSTEM`.
-      2. Strip the tool list down to :data:`DEFAULT_KEEP_TOOLS`.
+      2. Normalize the tool block for prompt caching, keeping *every* tool the
+         client defined. Pass ``keep_tools`` to trim the vocabulary for a
+         controlled benchmark (see :data:`DEFAULT_KEEP_TOOLS`); normal use keeps
+         all tools so Grep/Glob/TodoWrite/MCP servers keep working.
       3. Rebuild the messages array from the durable world (every prior file
          read / command run as a native, correctly-paired tool exchange) plus
-         an ``<operational_memory>`` block and the most recent live tool pair.
+         a ``<system-reminder>`` block and the most recent live tool pair.
 
     The model therefore receives the full *progression* of its work in valid
     Anthropic format, never a single frozen pair — which is what kept small
     models looping. The model's response uses Claude Code tool names
     (``Read`` / ``Bash`` / ``Write`` / ``Edit``) so Claude Code can execute it.
     """
-    keep = keep_tools if keep_tools is not None else DEFAULT_KEEP_TOOLS
+    # ``keep_tools=None`` (the default) keeps every tool the client defined;
+    # projection's win is compressing the growing history, not the fixed tool
+    # list, so normal use should never take tools away from the model.
+    keep = keep_tools
     messages = payload.get("messages") or []
 
     # Anthropic prompt caching only helps the native Claude path; default it
@@ -601,12 +693,24 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
     if cache_prefix is None:
         cache_prefix = preserve_claude_identity
 
-    # 1 + 2: always swap the system prompt and shrink the tool list.
+    # 1 + 2: swap the system prompt and normalize the tool block (keeping every
+    # tool the client defined by default — see ``keep`` below).
     payload["system"] = _build_system(payload.get("system"),
                                       preserve_claude_identity,
                                       cache_prefix=cache_prefix)
-    payload["tools"] = _filter_tools(payload.get("tools"), keep,
-                                     cache_last=cache_prefix)
+    prepared_tools = _prepare_tools(payload.get("tools"), keep=keep,
+                                    cache_last=cache_prefix)
+    if prepared_tools:
+        payload["tools"] = prepared_tools
+    else:
+        # Never emit ``"tools": null``. The interactive Claude Code TUI fires
+        # lightweight requests (conversation title, topic detection, quota
+        # checks) that carry no tools; ``_prepare_tools`` returns ``None`` for
+        # those and assigning it would add ``"tools": null`` — which Anthropic
+        # rejects with "tools: Input should be a valid array". Drop the key
+        # (and any now-orphaned ``tool_choice``) so the request stays valid.
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
 
     goal = sanitize_task(_extract_text(messages[0])) if messages else ""
 

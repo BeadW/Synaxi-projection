@@ -4,7 +4,7 @@ synaxi_projection.wrapper
 Wrap Claude Code with the Synaxi projection proxy — Headroom-style.
 
 How it works (same as Headroom):
-  1. Start a local proxy on http://127.0.0.1:\<port\>
+  1. Start a local proxy on http://127.0.0.1:<port>
   2. Write ANTHROPIC_BASE_URL into .claude/settings.local.json so ALL
      Claude Code sessions (including daemon-spawned workers) route through it.
   3. Launch `claude` as a subprocess with the env var also set directly.
@@ -42,7 +42,8 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def _write_base_url(proxy_url: str, settings_path: Path) -> Optional[str]:
+def _write_base_url(proxy_url: str, settings_path: Path,
+                    upstream: str = "https://api.anthropic.com") -> Optional[str]:
     """Inject ANTHROPIC_BASE_URL into a Claude settings file. Returns previous value."""
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict = {}
@@ -57,8 +58,17 @@ def _write_base_url(proxy_url: str, settings_path: Path) -> Optional[str]:
     previous = env_map.get("ANTHROPIC_BASE_URL")
     env_map["ANTHROPIC_BASE_URL"] = proxy_url
     env_map.setdefault("ENABLE_TOOL_SEARCH", "true")  # keep deferred tool schemas (Headroom #746)
-    if "api.anthropic.com" not in proxy_url:
+    # Auth token is keyed off the real UPSTREAM, not proxy_url (which is always
+    # the local proxy and never contains api.anthropic.com). Ollama accepts any
+    # non-empty token; the native Anthropic API must use Claude Code's own OAuth
+    # subscription auth, so we must *clear* any placeholder token — otherwise a
+    # stale ANTHROPIC_AUTH_TOKEN=ollama left by a previous Ollama wrap makes
+    # Claude Code send `Authorization: Bearer ollama` and every request fails
+    # with "Invalid bearer token".
+    if "api.anthropic.com" not in upstream:
         env_map["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+    else:
+        env_map.pop("ANTHROPIC_AUTH_TOKEN", None)
     payload["env"] = env_map
     settings_path.write_text(json.dumps(payload, indent=2) + "\n")
     return previous
@@ -76,6 +86,9 @@ def _restore_base_url(previous: Optional[str], settings_path: Path) -> None:
     env_map = payload.get("env")
     if not isinstance(env_map, dict):
         return
+    # ANTHROPIC_AUTH_TOKEN is proxy state we own (set only for the Ollama path);
+    # always clear it on unwrap so it can't leak into a later native session.
+    env_map.pop("ANTHROPIC_AUTH_TOKEN", None)
     if previous is None:
         env_map.pop("ANTHROPIC_BASE_URL", None)
         env_map.pop("ENABLE_TOOL_SEARCH", None)
@@ -91,6 +104,141 @@ def _restore_base_url(previous: Optional[str], settings_path: Path) -> None:
         settings_path.unlink(missing_ok=True)
 
 
+# Default interactive agent: the slim, tool-free chat orchestrator that
+# delegates coding to the projected ``synaxi-worker`` subagent.
+DEFAULT_AGENT = "synaxi-chat"
+
+# Subagent definitions shipped inside the package. ``wrap`` copies these into
+# Claude Code's agents dir for the duration of a session and removes them on
+# exit (see :func:`_install_agents` / :func:`_uninstall_agents`).
+_BUNDLED_AGENTS_DIR = Path(__file__).parent / "agents"
+
+
+def _bundled_agents() -> list:
+    """Return the agent-definition ``.md`` files shipped with the package."""
+    if not _BUNDLED_AGENTS_DIR.is_dir():
+        return []
+    return sorted(_BUNDLED_AGENTS_DIR.glob("*.md"))
+
+
+def _agents_target_dir() -> Path:
+    """Directory Claude Code loads user-scope subagents from.
+
+    Honors ``CLAUDE_CONFIG_DIR`` (which relocates ``~/.claude``) so we install
+    exactly where the launched ``claude`` will look. User scope is used rather
+    than the project's ``.claude/agents/`` so a wrap in any directory works and
+    we never risk our files being committed into the user's repository.
+    """
+    base = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    root = Path(base) if base else (Path.home() / ".claude")
+    return root / "agents"
+
+
+def _install_agents(target_dir: Path, bundled: Optional[list] = None) -> dict:
+    """Copy bundled agent definitions into ``target_dir`` for the session.
+
+    Mirrors the ``settings.local.json`` save/restore pattern: for each agent we
+    record whether the file pre-existed and its previous content, and we track
+    any directories we had to create. :func:`_uninstall_agents` uses that to
+    restore the exact prior state on exit — so we never clobber a user's own
+    same-named agent, and leave no directories behind.
+
+    Returns a JSON-serializable manifest ``{"agents": [...], "created_dirs": [...]}``
+    suitable for storing in the state file (crash recovery) and passing to
+    :func:`_uninstall_agents`.
+    """
+    if bundled is None:
+        bundled = _bundled_agents()
+
+    # Create missing ancestor dirs, remembering which ones we made so we can
+    # prune exactly those (and no pre-existing ones) on exit.
+    created_dirs: list = []
+    missing: list = []
+    d = target_dir
+    while not d.exists():
+        missing.append(d)
+        d = d.parent
+    for anc in reversed(missing):
+        anc.mkdir(exist_ok=True)
+        created_dirs.append(str(anc))
+
+    agents: list = []
+    for src in bundled:
+        dst = target_dir / src.name
+        existed = dst.exists()
+        previous = dst.read_text() if existed else None
+        dst.write_text(src.read_text())
+        agents.append({"path": str(dst), "existed": existed, "previous": previous})
+
+    return {"agents": agents, "created_dirs": created_dirs}
+
+
+def _uninstall_agents(manifest: Optional[dict]) -> None:
+    """Undo :func:`_install_agents`.
+
+    Restores overwritten files to their prior content, removes files we created,
+    and prunes (deepest-first) any directories we created that are now empty.
+    Safe to call with an empty/partial manifest and safe to call twice (used
+    both in the normal ``finally`` and for crash recovery on the next wrap).
+    """
+    if not isinstance(manifest, dict):
+        return
+    for rec in manifest.get("agents") or []:
+        try:
+            path = Path(rec["path"])
+            if rec.get("existed"):
+                prev = rec.get("previous")
+                if prev is not None:
+                    path.write_text(prev)
+            else:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    for d in sorted(manifest.get("created_dirs") or [], key=len, reverse=True):
+        try:
+            Path(d).rmdir()  # only succeeds if empty
+        except OSError:
+            pass
+
+
+def _agent_available(agent: str, cwd: Optional[Path] = None) -> bool:
+    """True when a subagent named ``agent`` is defined in project or user scope.
+
+    Passing ``--agent <name>`` for an undefined agent makes Claude Code error at
+    startup, so the convenience default is only injected when the definition is
+    actually on disk — either the project's ``.claude/agents/`` or the user-scope
+    dir we install into (:func:`_agents_target_dir`, honoring ``CLAUDE_CONFIG_DIR``).
+    """
+    if not agent:
+        return False
+    base = cwd or Path.cwd()
+    candidates = [
+        base / ".claude" / "agents" / f"{agent}.md",
+        _agents_target_dir() / f"{agent}.md",
+    ]
+    return any(p.exists() for p in candidates)
+
+
+def _finalize_claude_args(claude_args, model: str, agent: str,
+                          agent_available: bool) -> list:
+    """Prepend convenience defaults to the args passed to the ``claude`` binary.
+
+    Pure and deterministic (no I/O) so it can be unit-tested without launching
+    Claude Code. Neither default overrides an explicit user choice:
+
+      * ``--model <model>`` — unless the user already passed ``--model``.
+      * ``--agent <agent>`` — unless the user already passed ``--agent`` AND the
+        agent definition exists on disk (``agent_available``). An empty ``agent``
+        (``--no-agent``) skips it entirely.
+    """
+    args = list(claude_args)
+    if model and "--model" not in args:
+        args = ["--model", model] + args
+    if agent and agent_available and "--agent" not in args:
+        args = ["--agent", agent] + args
+    return args
+
+
 def wrap_claude(
     upstream: str = "https://api.anthropic.com",
     port: int = DEFAULT_PORT,
@@ -98,10 +246,16 @@ def wrap_claude(
     claude_args: tuple = (),
     no_proxy: bool = False,
     model: str = "",
+    agent: str = DEFAULT_AGENT,
 ) -> dict:
     """
     Start proxy, write settings.local.json, launch claude, restore on exit.
     Raises SystemExit with claude's return code.
+
+    ``agent`` defaults the interactive session to the slim ``synaxi-chat``
+    orchestrator (which delegates coding to the projected ``synaxi-worker``
+    subagent) when that agent is defined on disk. Pass ``agent=""`` to launch
+    plain Claude Code with no agent.
     """
     claude_bin = shutil.which("claude")
     if not claude_bin:
@@ -117,7 +271,14 @@ def wrap_claude(
         proxy_proc = start_proxy(port=port, upstream=upstream, model=model)
 
     settings_path = Path.cwd() / ".claude" / "settings.local.json"
-    saved_base_url = _write_base_url(effective_proxy_url, settings_path)
+    saved_base_url = _write_base_url(effective_proxy_url, settings_path, upstream)
+
+    # Install the bundled subagent definitions so Claude Code can launch
+    # ``--agent synaxi-chat`` and spawn the projected ``synaxi-worker``. First
+    # clean up any install left behind by a previous hard-killed session, then
+    # write fresh copies (recording prior state so exit restores it exactly).
+    _uninstall_agents(_load_state().get("installed_agents"))
+    agents_manifest = _install_agents(_agents_target_dir())
 
     _save_state({
         "wrapped": True,
@@ -126,6 +287,7 @@ def wrap_claude(
         "port": port,
         "settings_path": str(settings_path),
         "saved_base_url": saved_base_url,
+        "installed_agents": agents_manifest,
         "wrapped_at": int(time.time()),
     })
 
@@ -141,9 +303,8 @@ def wrap_claude(
     # claude-* model name against the API before the first request.
     # Only inject if the user hasn't already provided --model in claude_args.
     effective_model = model or ("qwen2.5-coder:7b" if is_ollama else "")
-    final_claude_args = list(claude_args)
-    if effective_model and "--model" not in final_claude_args:
-        final_claude_args = ["--model", effective_model] + final_claude_args
+    final_claude_args = _finalize_claude_args(
+        claude_args, effective_model, agent, _agent_available(agent))
 
     try:
         result = subprocess.run([claude_bin, *final_claude_args], env=env)
@@ -152,6 +313,7 @@ def wrap_claude(
         exit_code = 130
     finally:
         _restore_base_url(saved_base_url, settings_path)
+        _uninstall_agents(agents_manifest)
         stop_proxy(proxy_proc)
         _save_state({"wrapped": False, "unwrapped_at": int(time.time())})
 
@@ -159,10 +321,11 @@ def wrap_claude(
 
 
 def unwrap_claude() -> dict:
-    """Cleanup: remove ANTHROPIC_BASE_URL from settings.local.json."""
+    """Cleanup: remove ANTHROPIC_BASE_URL and the installed agent definitions."""
     st = _load_state()
     settings_path = Path(st.get("settings_path", str(Path.cwd() / ".claude" / "settings.local.json")))
     _restore_base_url(st.get("saved_base_url"), settings_path)
+    _uninstall_agents(st.get("installed_agents"))
     _save_state({"wrapped": False, "unwrapped_at": int(time.time())})
     return {"restored": True, "settings_path": str(settings_path)}
 
