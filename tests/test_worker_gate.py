@@ -99,6 +99,25 @@ def test_chat_agent_file_has_no_sentinel():
     assert WORKER_SENTINEL not in md
 
 
+# --- AskUserQuestion is a main-session-only tool ----------------------------
+# It depends on the conversation UI, so Claude Code blocks it for spawned
+# subagents even when listed in ``tools``. synaxi-chat runs as the *main* agent
+# (``--agent synaxi-chat``), so it may use it; the headless worker never can.
+
+def test_chat_agent_grants_ask_user_question():
+    """The chat orchestrator owns the UI and grills with structured choices, so
+    it must keep AskUserQuestion in its tool allowlist."""
+    md = (AGENTS / "synaxi-chat.md").read_text()
+    assert "AskUserQuestion" in md
+
+
+def test_worker_agent_has_no_ask_user_question():
+    """The worker is a headless subagent with no conversation UI: granting it a
+    UI-gated tool would be dead weight (and misleading), so keep it out."""
+    md = (AGENTS / "synaxi-worker.md").read_text()
+    assert "AskUserQuestion" not in md
+
+
 # --- end-to-end: a worker payload projects to constant space ----------------
 
 def test_worker_payload_projects_to_constant_system():
