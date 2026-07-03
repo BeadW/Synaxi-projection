@@ -4,7 +4,7 @@ synaxi_projection.wrapper
 Wrap Claude Code with the Synaxi projection proxy — Headroom-style.
 
 How it works (same as Headroom):
-  1. Start a local proxy on http://127.0.0.1:\<port\>
+  1. Start a local proxy on http://127.0.0.1:<port>
   2. Write ANTHROPIC_BASE_URL into .claude/settings.local.json so ALL
      Claude Code sessions (including daemon-spawned workers) route through it.
   3. Launch `claude` as a subprocess with the env var also set directly.
@@ -42,7 +42,8 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def _write_base_url(proxy_url: str, settings_path: Path) -> Optional[str]:
+def _write_base_url(proxy_url: str, settings_path: Path,
+                    upstream: str = "https://api.anthropic.com") -> Optional[str]:
     """Inject ANTHROPIC_BASE_URL into a Claude settings file. Returns previous value."""
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict = {}
@@ -57,8 +58,17 @@ def _write_base_url(proxy_url: str, settings_path: Path) -> Optional[str]:
     previous = env_map.get("ANTHROPIC_BASE_URL")
     env_map["ANTHROPIC_BASE_URL"] = proxy_url
     env_map.setdefault("ENABLE_TOOL_SEARCH", "true")  # keep deferred tool schemas (Headroom #746)
-    if "api.anthropic.com" not in proxy_url:
+    # Auth token is keyed off the real UPSTREAM, not proxy_url (which is always
+    # the local proxy and never contains api.anthropic.com). Ollama accepts any
+    # non-empty token; the native Anthropic API must use Claude Code's own OAuth
+    # subscription auth, so we must *clear* any placeholder token — otherwise a
+    # stale ANTHROPIC_AUTH_TOKEN=ollama left by a previous Ollama wrap makes
+    # Claude Code send `Authorization: Bearer ollama` and every request fails
+    # with "Invalid bearer token".
+    if "api.anthropic.com" not in upstream:
         env_map["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+    else:
+        env_map.pop("ANTHROPIC_AUTH_TOKEN", None)
     payload["env"] = env_map
     settings_path.write_text(json.dumps(payload, indent=2) + "\n")
     return previous
@@ -76,6 +86,9 @@ def _restore_base_url(previous: Optional[str], settings_path: Path) -> None:
     env_map = payload.get("env")
     if not isinstance(env_map, dict):
         return
+    # ANTHROPIC_AUTH_TOKEN is proxy state we own (set only for the Ollama path);
+    # always clear it on unwrap so it can't leak into a later native session.
+    env_map.pop("ANTHROPIC_AUTH_TOKEN", None)
     if previous is None:
         env_map.pop("ANTHROPIC_BASE_URL", None)
         env_map.pop("ENABLE_TOOL_SEARCH", None)
@@ -117,7 +130,7 @@ def wrap_claude(
         proxy_proc = start_proxy(port=port, upstream=upstream, model=model)
 
     settings_path = Path.cwd() / ".claude" / "settings.local.json"
-    saved_base_url = _write_base_url(effective_proxy_url, settings_path)
+    saved_base_url = _write_base_url(effective_proxy_url, settings_path, upstream)
 
     _save_state({
         "wrapped": True,
