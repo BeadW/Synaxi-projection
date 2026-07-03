@@ -197,8 +197,14 @@ installs **two** Claude Code subagents and projects only one of them:
 
 | Agent | Tools | Proxy treatment |
 | ----- | ----- | --------------- |
-| **`synaxi-chat`** | `Agent(synaxi-worker)` only | **passthrough** — a tool-free orchestrator that *grills* the user one question at a time (each with a recommended answer) into a self-contained, BDD-shaped brief, then delegates it to the worker |
+| **`synaxi-chat`** | `Agent(synaxi-worker)`, `AskUserQuestion` | **passthrough** — a code-free orchestrator that *grills* the user one question at a time (each with a recommended answer, offered as structured `AskUserQuestion` choices when the decision is discrete) into a self-contained, BDD-shaped brief, then delegates it to the worker |
 | **`synaxi-worker`** | `Read` `Write` `Edit` `Bash` `Grep` `Glob` | **projected** — the autonomous coder whose ever-growing context is what projection shrinks to constant space |
+
+> `AskUserQuestion` depends on the conversation UI, so Claude Code blocks it for
+> *spawned* subagents. `synaxi-chat` runs as the **main** session agent
+> (`--agent synaxi-chat`), so it owns the UI and may use it; the headless worker
+> never can.
+
 
 ### How the proxy tells them apart: a sentinel, not a fingerprint
 
