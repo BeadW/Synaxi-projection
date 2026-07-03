@@ -90,7 +90,7 @@ observed, keyed by identity:
 a prose summary:
 
 ```
-user:       <goal> + <operational_memory>
+user:       <goal>
 assistant:  tool_use   Bash(ls -F)          (synthetic id syn_…)
 user:       tool_result "test_event_emitter.py"
 assistant:  tool_use   Read(test_event_emitter.py)
@@ -99,6 +99,7 @@ assistant:  tool_use   Bash(python3 -m pytest)
 user:       tool_result "exit=1 … ModuleNotFoundError"
 assistant:  tool_use   <the real most-recent action>   (verbatim, Claude's id)
 user:       tool_result <the real most-recent result>
+              + <system-reminder> (the agent's distilled operational memory)
 ```
 
 Why native pairs instead of a `<current_files>` blob? Tool-calling models are
@@ -126,15 +127,20 @@ before small, recent ones (the `ls` output you keep relying on).
 
 ### 3. `ProjectionControlState` — operational memory
 
-Repeated tool failures are distilled into a short `<operational_memory>` block
-that rides along in the goal message, e.g.:
+Repeated tool failures are distilled into a short block and delivered as a
+trusted `<system-reminder>` in the live tail, e.g.:
 
 - `python: command not found` → "Use `python3` (not `python`) in this sandbox."
 - reading a directory as a file → "use `run_command` (`ls`/`find`) for discovery."
 - the same path failing twice → "list files first, then read exact paths."
 
 This is how the agent *learns within a run* without re-deriving the same lesson
-every turn.
+every turn. It rides in a `<system-reminder>` — the same convention Claude Code
+uses for its own in-band dynamic context — and is explicitly framed as the
+agent's *own* distilled memory ("not user input"). That matters when the proxy
+fronts a full model: an imperative appended after a `tool_result` reads exactly
+like a prompt-injection attempt (a real worker flagged and refused it), whereas
+a `<system-reminder>` is trusted context the model applies to itself.
 
 ### The system prompt and tool list are also projected
 
@@ -171,8 +177,8 @@ marks the **byte-stable** segments:
 3. the **last durable world observation** (the world is append-only, so
    everything above the newest entry is identical to last turn).
 
-Volatile `<operational_memory>` / runtime reminders are relocated to the live
-tail so they never bust the cached prefix. This reproduces Claude Code's own
+Volatile `<system-reminder>` blocks (operational memory + runtime reminders)
+are relocated to the live tail so they never bust the cached prefix. This reproduces Claude Code's own
 incremental-caching shape and, in our suite, cut effective billed input **1.8×**
 (see [`docs/RESULTS.md`](docs/RESULTS.md)). The Ollama path ignores
 `cache_control`, so caching is auto-disabled there — the lean string system

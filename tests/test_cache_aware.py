@@ -86,7 +86,7 @@ def test_native_has_exactly_three_breakpoints_on_stable_segments():
     assert not any(isinstance(b, dict) and "cache_control" in b for b in last)
 
     # operational memory must be relocated off msg[0] so the prefix stays stable.
-    assert "operational_memory" not in p["messages"][0]["content"][0]["text"]
+    assert "<system-reminder>" not in p["messages"][0]["content"][0]["text"]
 
 
 def test_ollama_path_has_no_breakpoints():

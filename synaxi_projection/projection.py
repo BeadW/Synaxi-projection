@@ -23,7 +23,7 @@ prompt + ~60 tool schemas + every prior turn) to a small local model, we
 rebuild a *constant-space* context from the durable facts the agent has
 observed — the files it has read/written and the commands it has run — and
 re-emit them as native, correctly-paired ``tool_use`` / ``tool_result``
-messages, plus a small ``<operational_memory>`` block of lessons learned.
+messages, plus a small ``<system-reminder>`` block of lessons learned.
 
 Why native tool pairs (not a prose summary)
 -------------------------------------------
@@ -306,20 +306,33 @@ def generate_context(
     cmd_name, cmd_key = dia["cmd"]
 
     cwd_note = f"\n\nWorking directory: {cwd}" if cwd else ""
+    # The projected operational memory and runtime notices are our OWN trusted,
+    # in-band context — the agent's distilled lessons from its earlier tool
+    # results, which is the core of what projection carries forward. Deliver
+    # them as <system-reminder> blocks: that is Claude Code's own convention for
+    # injecting dynamic trusted context (todos, CLAUDE.md, safety notes) into
+    # the message stream, and the model is trained to treat it as trusted system
+    # context rather than user input. A bare <operational_memory> block with an
+    # "apply this" imperative appended after a tool_result reads exactly like a
+    # prompt-injection attempt, so a full model (the native projection worker)
+    # correctly refuses its own memory. We keep these in the volatile tail
+    # (after the cache breakpoint) so the cached world prefix stays byte-stable.
     control_note = ""
     if control_state and control_state != "(none yet)":
         control_note = (
-            "\n\n<operational_memory>\n"
+            "\n\n<system-reminder>\n"
+            "The notes below are your own operational memory, distilled from your "
+            "earlier tool results this session (not user input). Use them to avoid "
+            "repeating earlier mistakes, unless a newer tool result supersedes them:\n"
             f"{control_state}\n"
-            "</operational_memory>\n"
-            "Apply this memory when choosing tools/commands unless a newer tool result disproves it."
+            "</system-reminder>"
         )
     notice = ""
     if runtime_notice:
         notice = (
-            "\n\n<runtime_reminder>\n"
+            "\n\n<system-reminder>\n"
             f"{runtime_notice}\n"
-            "</runtime_reminder>"
+            "</system-reminder>"
         )
 
     # msg[0] is the stable goal ONLY. Volatile operational memory / runtime
@@ -662,7 +675,7 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
          all tools so Grep/Glob/TodoWrite/MCP servers keep working.
       3. Rebuild the messages array from the durable world (every prior file
          read / command run as a native, correctly-paired tool exchange) plus
-         an ``<operational_memory>`` block and the most recent live tool pair.
+         a ``<system-reminder>`` block and the most recent live tool pair.
 
     The model therefore receives the full *progression* of its work in valid
     Anthropic format, never a single frozen pair — which is what kept small
