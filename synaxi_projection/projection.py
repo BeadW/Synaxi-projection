@@ -605,8 +605,19 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
     payload["system"] = _build_system(payload.get("system"),
                                       preserve_claude_identity,
                                       cache_prefix=cache_prefix)
-    payload["tools"] = _filter_tools(payload.get("tools"), keep,
-                                     cache_last=cache_prefix)
+    filtered_tools = _filter_tools(payload.get("tools"), keep,
+                                   cache_last=cache_prefix)
+    if filtered_tools:
+        payload["tools"] = filtered_tools
+    else:
+        # Never emit ``"tools": null``. The interactive Claude Code TUI fires
+        # lightweight requests (conversation title, topic detection, quota
+        # checks) that carry no tools; ``_filter_tools`` returns ``None`` for
+        # those and assigning it would add ``"tools": null`` — which Anthropic
+        # rejects with "tools: Input should be a valid array". Drop the key
+        # (and any now-orphaned ``tool_choice``) so the request stays valid.
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
 
     goal = sanitize_task(_extract_text(messages[0])) if messages else ""
 
