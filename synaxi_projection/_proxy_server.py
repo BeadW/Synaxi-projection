@@ -256,8 +256,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             body = json.dumps(payload).encode()
 
-            # 4. Forward upstream and capture the response for logging.
-            resp_body = self._forward_capture(body)
+            # 4. Forward upstream and capture the response (status + body).
+            status, up_headers, resp_body = self._forward_capture(body)
 
             try:
                 resp_json = json.loads(resp_body) if resp_body else {}
@@ -275,6 +275,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "projection_meta": {
                     "is_worker": is_worker,
                     "projected": do_project,
+                    "upstream_status": status,
                     "original_system_len": original_system_len,
                     "original_tools_count": original_tools_count,
                     "projected_system_len": len(str(payload.get("system") or "")),
@@ -286,9 +287,44 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "response": resp_json,
             })
 
-            # Re-emit as SSE when the client requested a stream (interactive
-            # Claude Code TUI); otherwise return the buffered JSON (claude -p,
-            # benchmark harness).
+            # Surface upstream failures with their REAL status code. Anthropic
+            # signals rate limits (429), overload (529), and server faults (5xx)
+            # via HTTP status, and Claude Code backs off / retries on those. If we
+            # flatten them to 200 — whether as an error envelope or an empty body
+            # — the client can't parse a Message and reports "empty or malformed
+            # response (HTTP 200)", terminating the agent instead of retrying. A
+            # 200 with an unparseable/empty body is the same trap, so promote it
+            # to 502. Errors are relayed verbatim (never re-emitted as SSE); only
+            # a genuine 2xx Message flows to the stream/JSON path below.
+            is_error_body = isinstance(resp_json, dict) and resp_json.get("type") == "error"
+            is_blank_200 = status < 400 and (not resp_json or "content" not in resp_json)
+            if status >= 400 or is_error_body or is_blank_200:
+                if status < 400:
+                    # A 2xx wrapping an error envelope, or an empty/malformed 2xx:
+                    # promote to 502 so the client treats it as a real failure.
+                    status = 502
+                    if is_blank_200 and not is_error_body:
+                        resp_body = json.dumps({
+                            "type": "error",
+                            "error": {"type": "api_error",
+                                      "message": "upstream returned an empty or malformed "
+                                                 "response with HTTP 200"},
+                        }).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                # Preserve retry-after so the client backs off the right amount.
+                if up_headers is not None:
+                    retry_after = up_headers.get("retry-after")
+                    if retry_after:
+                        self.send_header("Retry-After", retry_after)
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+                return
+
+            # Re-emit a genuine success as SSE when the client requested a stream
+            # (interactive Claude Code TUI); otherwise return the buffered JSON
+            # (claude -p, benchmark harness).
             if client_wants_stream:
                 out_body = _message_to_sse(resp_json)
                 self.send_response(200)
@@ -341,17 +377,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return headers
 
     def _forward_capture(self, body):
-        """Forward body upstream and return the response bytes (for logging)."""
+        """Forward body upstream and return ``(status, headers, body-bytes)``.
+
+        The status and headers are propagated by the ``/v1/messages`` handler so
+        that upstream failures (429 rate-limit, 529 overload, 5xx, 404) reach
+        Claude Code with their REAL HTTP status instead of being flattened to
+        200. Claude Code has native backoff/retry for those statuses; if we hand
+        it a 200 wrapping an error envelope (or an empty body) it can't parse a
+        Message and reports "empty or malformed response (HTTP 200)", killing the
+        agent instead of retrying.
+        """
         url = UPSTREAM + self.path
         headers = self._upstream_headers(len(body))
         req = urllib.request.Request(url, data=body, headers=headers, method=self.command)
         try:
             with self._build_opener(url).open(req, timeout=600) as resp:
-                return resp.read()
+                return resp.status, resp.headers, resp.read()
         except urllib.error.HTTPError as e:
-            return e.read()
+            return e.code, e.headers, e.read()
         except Exception as exc:
-            return json.dumps({"type": "error", "error": {"message": str(exc)}}).encode()
+            body = json.dumps({"type": "error",
+                               "error": {"type": "api_error", "message": str(exc)}}).encode()
+            return 502, None, body
+
 
     def _forward(self, body):
         url = UPSTREAM + self.path

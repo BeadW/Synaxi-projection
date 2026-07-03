@@ -14,6 +14,7 @@ import json
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -197,6 +198,16 @@ def _serve(server):
     return t
 
 
+def _wait_ready(port, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+            return
+        except Exception:
+            time.sleep(0.05)
+
+
 def _post(port, stream):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/messages",
@@ -205,6 +216,20 @@ def _post(port, stream):
         headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         return r.headers.get("Content-Type"), r.read().decode()
+
+
+def _post_capture(port, stream):
+    """POST and return ``(status, headers, body)`` even for non-2xx responses."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/messages",
+        data=json.dumps({"model": "claude-x", "stream": stream,
+                         "messages": [{"role": "user", "content": "hey"}]}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, dict(r.headers), r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
 
 
 def test_end_to_end_stream_vs_json(tmp_path):
@@ -217,14 +242,7 @@ def test_end_to_end_stream_vs_json(tmp_path):
     px_port = proxy.server_address[1]
     _serve(proxy)
     try:
-        # readiness
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{px_port}/health", timeout=1)
-                break
-            except Exception:
-                time.sleep(0.05)
+        _wait_ready(px_port)
 
         ct_s, body_s = _post(px_port, True)
         assert ct_s.startswith("text/event-stream")
@@ -238,3 +256,92 @@ def test_end_to_end_stream_vs_json(tmp_path):
     finally:
         proxy.shutdown()
         upstream.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Upstream errors reach the client with their real status (not a flattened 200)
+# ---------------------------------------------------------------------------
+# Regression: a worker hit Anthropic's rate limit after ~400 projected turns.
+# Upstream returned HTTP 429, but the proxy forced HTTP 200 around the error
+# envelope, so Claude Code reported "empty or malformed response (HTTP 200) —
+# check for a proxy or gateway intercepting the request" and killed the agent
+# instead of backing off. The proxy must relay the real status + Retry-After.
+
+class _RateLimitUpstream(BaseHTTPRequestHandler):
+    def log_message(self, *a):  # silence
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        if n:
+            self.rfile.read(n)
+        body = json.dumps({
+            "type": "error",
+            "error": {"type": "rate_limit_error",
+                      "message": "This request would exceed your account's rate limit."},
+        }).encode()
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "42")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _BlankUpstream(BaseHTTPRequestHandler):
+    def log_message(self, *a):  # silence
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        if n:
+            self.rfile.read(n)
+        # HTTP 200 with an empty body — the other shape of the "malformed 200".
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_upstream_rate_limit_status_is_propagated(tmp_path, stream):
+    upstream = HTTPServer(("127.0.0.1", 0), _RateLimitUpstream)
+    up_port = upstream.server_address[1]
+    _serve(upstream)
+    mod = _load_proxy(f"http://127.0.0.1:{up_port}", str(tmp_path / "logs"))
+    proxy = HTTPServer(("127.0.0.1", 0), mod.ProxyHandler)
+    px_port = proxy.server_address[1]
+    _serve(proxy)
+    try:
+        _wait_ready(px_port)
+        status, headers, body = _post_capture(px_port, stream)
+        # The real 429 must reach the client (NEVER flattened to 200, NEVER
+        # re-emitted as an SSE 200), so Claude Code's native backoff engages.
+        assert status == 429
+        assert json.loads(body)["error"]["type"] == "rate_limit_error"
+        # Retry-After is preserved so the client waits the right amount.
+        assert headers.get("Retry-After") == "42"
+    finally:
+        proxy.shutdown()
+        upstream.shutdown()
+
+
+def test_blank_200_upstream_becomes_502(tmp_path):
+    upstream = HTTPServer(("127.0.0.1", 0), _BlankUpstream)
+    up_port = upstream.server_address[1]
+    _serve(upstream)
+    mod = _load_proxy(f"http://127.0.0.1:{up_port}", str(tmp_path / "logs"))
+    proxy = HTTPServer(("127.0.0.1", 0), mod.ProxyHandler)
+    px_port = proxy.server_address[1]
+    _serve(proxy)
+    try:
+        _wait_ready(px_port)
+        status, _headers, body = _post_capture(px_port, True)
+        # An empty/malformed 200 is the exact trap that makes Claude Code report
+        # "malformed response (HTTP 200)". Promote it to a real 502 error.
+        assert status == 502
+        assert json.loads(body)["error"]["type"] == "api_error"
+    finally:
+        proxy.shutdown()
+        upstream.shutdown()
+
