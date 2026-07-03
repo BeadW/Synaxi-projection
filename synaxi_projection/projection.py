@@ -66,6 +66,9 @@ __all__ = [
     "PROJECTION_SYSTEM",
     "CLAUDE_CODE_IDENTITY",
     "DEFAULT_KEEP_TOOLS",
+    "WORKER_SENTINEL",
+    "system_text",
+    "is_worker_payload",
 ]
 
 
@@ -589,6 +592,61 @@ def _prepare_tools(tools: Optional[list], keep: Optional[set] = None,
     if cache_last and prepared:
         prepared[-1] = _with_cc(prepared[-1])
     return prepared
+
+
+# ---------------------------------------------------------------------------
+# Worker-subagent detection.
+#
+# We do not fingerprint the worker heuristically — we *stamp* it. A custom
+# Claude Code subagent's markdown body becomes its API ``system`` prompt
+# verbatim (plus a few environment lines Claude Code appends), never the full
+# Claude Code system prompt. So embedding this sentinel in the body of
+# ``.claude/agents/synaxi-worker.md`` gives the proxy a deterministic,
+# version-proof marker on the wire:
+#
+#     sentinel present  -> project (this is our agentic worker)
+#     sentinel absent    -> pass through untouched (interactive chat, /init,
+#                           the chat orchestrator, title/topic/quota sidecars)
+#
+# The sentinel is only read *before* projection swaps the system prompt out, so
+# the model itself never sees it. Keep this string in sync with the agent file;
+# ``tests/test_worker_gate.py`` guards that they never drift apart.
+# ---------------------------------------------------------------------------
+WORKER_SENTINEL = "SYNAXI-PROJECTION-WORKER"
+
+
+def system_text(system) -> str:
+    """Flatten an Anthropic ``system`` field to plain text.
+
+    ``system`` may be a plain string or a list of content blocks
+    (``{"type": "text", "text": ...}``). Return the concatenated text so
+    callers can substring-search it (e.g. for :data:`WORKER_SENTINEL`).
+    """
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts = []
+        for blk in system:
+            if isinstance(blk, dict):
+                parts.append(str(blk.get("text", "")))
+            elif isinstance(blk, str):
+                parts.append(blk)
+        return "\n".join(parts)
+    return ""
+
+
+def is_worker_payload(payload: dict) -> bool:
+    """True when a request originated from the Synaxi projection worker subagent.
+
+    The worker's system prompt (its subagent markdown body) carries
+    :data:`WORKER_SENTINEL`, and Claude Code sends that body verbatim as the
+    request ``system``. Detecting it lets the proxy project *only* the worker's
+    agentic turns and forward every other request — interactive chat, ``/init``,
+    the tool-free chat orchestrator, and lightweight sidecars — unchanged.
+    """
+    if not isinstance(payload, dict):
+        return False
+    return WORKER_SENTINEL in system_text(payload.get("system"))
 
 
 def project_payload(payload: dict, keep_tools: Optional[set] = None,

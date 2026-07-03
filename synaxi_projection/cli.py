@@ -18,6 +18,12 @@ def main() -> None:
                         help="Model name to send to Ollama (e.g. gemma4:latest, qwen2.5-coder:7b)")
     p_wrap.add_argument("--port", type=int, default=8787, help="Local proxy port (default: 8787)")
     p_wrap.add_argument("--no-proxy", action="store_true", help="Reuse already-running proxy")
+    p_wrap.add_argument("--agent", default="synaxi-chat",
+                        help="Interactive agent to launch (default: synaxi-chat, the tool-free "
+                             "chat orchestrator that delegates coding to the projected worker). "
+                             "Only injected when the agent is defined on disk.")
+    p_wrap.add_argument("--no-agent", action="store_true",
+                        help="Launch plain Claude Code with no agent (overrides --agent)")
 
     sub.add_parser("unwrap", help="Remove proxy config and restore settings")
     sub.add_parser("status", help="Show wrapper/proxy status")
@@ -29,12 +35,14 @@ def main() -> None:
     if args.cmd == "wrap":
         # strip 'claude' positional from remaining; everything else goes to claude binary
         claude_args = tuple(a for a in remaining if a != "claude")
+        agent = "" if args.no_agent else args.agent
         wrap_claude(
             upstream=args.upstream,
             port=args.port,
             claude_args=claude_args,
             no_proxy=args.no_proxy,
             model=args.model,
+            agent=agent,
         )
         return
 

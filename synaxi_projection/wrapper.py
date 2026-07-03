@@ -104,6 +104,49 @@ def _restore_base_url(previous: Optional[str], settings_path: Path) -> None:
         settings_path.unlink(missing_ok=True)
 
 
+# Default interactive agent: the slim, tool-free chat orchestrator that
+# delegates coding to the projected ``synaxi-worker`` subagent.
+DEFAULT_AGENT = "synaxi-chat"
+
+
+def _agent_available(agent: str, cwd: Optional[Path] = None) -> bool:
+    """True when a subagent named ``agent`` is defined in project or user scope.
+
+    Passing ``--agent <name>`` for an undefined agent makes Claude Code error at
+    startup, so the convenience default is only injected when the definition is
+    actually on disk (this repo's ``.claude/agents/`` while developing, or
+    ``~/.claude/agents/`` once installed globally).
+    """
+    if not agent:
+        return False
+    base = cwd or Path.cwd()
+    candidates = [
+        base / ".claude" / "agents" / f"{agent}.md",
+        Path.home() / ".claude" / "agents" / f"{agent}.md",
+    ]
+    return any(p.exists() for p in candidates)
+
+
+def _finalize_claude_args(claude_args, model: str, agent: str,
+                          agent_available: bool) -> list:
+    """Prepend convenience defaults to the args passed to the ``claude`` binary.
+
+    Pure and deterministic (no I/O) so it can be unit-tested without launching
+    Claude Code. Neither default overrides an explicit user choice:
+
+      * ``--model <model>`` — unless the user already passed ``--model``.
+      * ``--agent <agent>`` — unless the user already passed ``--agent`` AND the
+        agent definition exists on disk (``agent_available``). An empty ``agent``
+        (``--no-agent``) skips it entirely.
+    """
+    args = list(claude_args)
+    if model and "--model" not in args:
+        args = ["--model", model] + args
+    if agent and agent_available and "--agent" not in args:
+        args = ["--agent", agent] + args
+    return args
+
+
 def wrap_claude(
     upstream: str = "https://api.anthropic.com",
     port: int = DEFAULT_PORT,
@@ -111,10 +154,16 @@ def wrap_claude(
     claude_args: tuple = (),
     no_proxy: bool = False,
     model: str = "",
+    agent: str = DEFAULT_AGENT,
 ) -> dict:
     """
     Start proxy, write settings.local.json, launch claude, restore on exit.
     Raises SystemExit with claude's return code.
+
+    ``agent`` defaults the interactive session to the slim ``synaxi-chat``
+    orchestrator (which delegates coding to the projected ``synaxi-worker``
+    subagent) when that agent is defined on disk. Pass ``agent=""`` to launch
+    plain Claude Code with no agent.
     """
     claude_bin = shutil.which("claude")
     if not claude_bin:
@@ -154,9 +203,8 @@ def wrap_claude(
     # claude-* model name against the API before the first request.
     # Only inject if the user hasn't already provided --model in claude_args.
     effective_model = model or ("qwen2.5-coder:7b" if is_ollama else "")
-    final_claude_args = list(claude_args)
-    if effective_model and "--model" not in final_claude_args:
-        final_claude_args = ["--model", effective_model] + final_claude_args
+    final_claude_args = _finalize_claude_args(
+        claude_args, effective_model, agent, _agent_available(agent))
 
     try:
         result = subprocess.run([claude_bin, *final_claude_args], env=env)

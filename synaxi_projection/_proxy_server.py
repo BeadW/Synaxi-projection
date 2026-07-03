@@ -3,10 +3,12 @@ synaxi_projection._proxy_server
 MITM proxy between Claude Code and Ollama (or Anthropic).
 
 Ollama speaks the Anthropic Messages API natively (v0.14.0+), so no format
-translation is needed. This proxy's whole job is projection: on every
-/v1/messages request it replaces Claude Code's enormous accumulated context
-with a compact, correctly-paired one rebuilt by
-synaxi_projection.projection.project_payload. It then:
+translation is needed. This proxy's whole job is projection: on each
+/v1/messages request from the Synaxi *worker* subagent it replaces Claude
+Code's enormous accumulated context with a compact, correctly-paired one
+rebuilt by synaxi_projection.projection.project_payload. Requests that are not
+the worker (interactive chat, /init, the tool-free chat orchestrator, and
+title / topic / quota sidecars) are forwarded untouched. It then:
 
   1. Rewrites the model name (claude-* -> the local Ollama tag)
   2. Forces non-streaming so the full response can be buffered + logged
@@ -36,16 +38,21 @@ from pathlib import Path
 # standalone script (so sys.path[0] is this directory, not the repo root);
 # fall back to inserting the repo root so the package import resolves.
 try:
-    from synaxi_projection.projection import project_payload
+    from synaxi_projection.projection import project_payload, is_worker_payload
 except ImportError:  # pragma: no cover - script-mode bootstrap
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from synaxi_projection.projection import project_payload
+    from synaxi_projection.projection import project_payload, is_worker_payload
 
 UPSTREAM = os.environ.get("SYNAXI_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 PORT = int(os.environ.get("SYNAXI_PORT", "8787"))
 MODEL = os.environ.get("SYNAXI_MODEL", "")
 IS_OLLAMA = "api.anthropic.com" not in UPSTREAM
 DISABLE_PROJECTION = os.environ.get("SYNAXI_DISABLE_PROJECTION", "").strip().lower() not in ("", "0", "false", "no")
+# By default projection is applied ONLY to the Synaxi worker subagent (detected
+# by the sentinel its system prompt carries). Set SYNAXI_PROJECT_ALL=1 to
+# project every /v1/messages request instead — the pre-subagent behaviour, kept
+# for benchmarking / A-B against a small local model with no custom agent.
+PROJECT_ALL = os.environ.get("SYNAXI_PROJECT_ALL", "").strip().lower() not in ("", "0", "false", "no")
 
 LOG_DIR = Path(os.environ.get("SYNAXI_LOG_DIR", Path.home() / ".synaxi-projection" / "conversations"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -198,10 +205,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             client_wants_stream = bool(payload.get("stream"))
 
             # 1. Apply projection (rebuild compact, correctly-paired context).
-            # Baseline A/B (SYNAXI_DISABLE_PROJECTION=1): forward the
-            # full, growing payload untouched so projection can be
-            # compared against no-projection on the same model.
-            if not DISABLE_PROJECTION:
+            # Gate: project ONLY the Synaxi worker subagent's turns, detected by
+            # the sentinel its system prompt carries (see projection.py). The
+            # interactive chat orchestrator, /init, and lightweight sidecars
+            # (title / topic / quota) carry no sentinel and pass through
+            # untouched — which is also what keeps conversational turns intact.
+            #   * SYNAXI_DISABLE_PROJECTION=1 -> forward everything untouched
+            #     (baseline A/B: projection vs no-projection on the same model).
+            #   * SYNAXI_PROJECT_ALL=1        -> project every request
+            #     (pre-subagent behaviour, for benchmarking a small local model).
+            is_worker = is_worker_payload(payload)
+            do_project = (not DISABLE_PROJECTION) and (PROJECT_ALL or is_worker)
+            if do_project:
                 payload = project_payload(payload, preserve_claude_identity=not IS_OLLAMA)
 
             # 2. Rewrite the model name when talking to Ollama.
@@ -230,6 +245,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "original_msg_count": original_msg_count,
                 "projected_msg_count": len(projected_msgs),
                 "projection_meta": {
+                    "is_worker": is_worker,
+                    "projected": do_project,
                     "original_system_len": original_system_len,
                     "original_tools_count": original_tools_count,
                     "projected_system_len": len(str(payload.get("system") or "")),
