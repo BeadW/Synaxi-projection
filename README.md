@@ -143,7 +143,7 @@ to; the rest of history is the deduped world above it.
 
 ### 2. Token-weighted LRU eviction
 
-The world is bounded (`token_budget = 8000`). On each turn `WorldCache.tick()`
+The world is bounded by a token budget. On each turn `WorldCache.tick()`
 evicts the highest-cost entries first:
 
 ```
@@ -152,6 +152,15 @@ score = tokens(entry) * turns_since_last_used
 
 Large, stale entries (an old file you haven't touched in 10 turns) are evicted
 before small, recent ones (the `ls` output you keep relying on).
+
+The budget is sized to the upstream model. The in-process benchmark loop, whose
+model is a small local one, uses a tight `token_budget = 8000`. The **proxy**,
+which fronts a large-context model (native Claude's 200 K window), defaults to a
+much larger `DEFAULT_WORLD_TOKEN_BUDGET` (80 000, override with
+`SYNAXI_WORLD_TOKEN_BUDGET`) — because a budget *smaller than the working set*
+thrashes: a source file bigger than the budget is evicted the turn after it is
+read and then re-read every turn, burning tokens and tripping rate limits.
+Sizing the budget above the working set keeps every observed file resident.
 
 ### 3. `ProjectionControlState` — operational memory
 

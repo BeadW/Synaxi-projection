@@ -54,6 +54,7 @@ compressed back into the model's context). See the README for the full diagram.
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Optional
 
 __all__ = [
@@ -66,6 +67,7 @@ __all__ = [
     "PROJECTION_SYSTEM",
     "CLAUDE_CODE_IDENTITY",
     "DEFAULT_KEEP_TOOLS",
+    "DEFAULT_WORLD_TOKEN_BUDGET",
     "WORKER_SENTINEL",
     "system_text",
     "is_worker_payload",
@@ -160,6 +162,32 @@ def _strip_cc(block):
 # ===========================================================================
 # WorldCache — token-weighted observation cache (verbatim shared definition)
 # ===========================================================================
+
+# Token budget for the world the *proxy* rebuilds in front of Claude Code.
+#
+# The original 8 000 was tuned for the in-process benchmark loop, whose model is
+# a small local one (qwen2.5-coder:7b) with a tiny context — there, 8 000 is
+# right, and benchmark.py still constructs its own WorldCache(8000) directly.
+#
+# But when the proxy fronts *native Claude* (a 200 K window), crushing the world
+# to 8 000 backfires badly. A single source file often exceeds 8 000 tokens on
+# its own, so the moment it is read it is over budget and the token-weighted
+# eviction (score = tokens x turns_since_used) throws it straight back out —
+# whereupon the model, no longer seeing it, re-reads it. Real session logs show
+# one 8.7 K-token file re-read 87 times and ~89 % of all reads being re-reads,
+# wasting ~1 M input tokens and pinning the account's tokens-per-minute limit
+# until it 429s. The cache was smaller than the working set, so it thrashed.
+#
+# So default the proxy budget generously: large enough to hold a multi-file
+# working set resident (killing the thrash), yet well under the window so that
+# projected input + a 64 K completion still fits (input + max_tokens <= 200 K).
+# Override with SYNAXI_WORLD_TOKEN_BUDGET to experiment.
+#
+# TODO(intelligent-budget): pick this per-request from the upstream model's real
+# context window and the task's observed working-set size, instead of one
+# constant. Tracked as a follow-up; this constant is the deliberate stopgap.
+DEFAULT_WORLD_TOKEN_BUDGET = int(os.environ.get("SYNAXI_WORLD_TOKEN_BUDGET", "80000"))
+
 
 class WorldCache:
     """Observation cache for the projection agent.
@@ -480,6 +508,7 @@ def _ingest(world: "WorldCache", name: str, inp: dict, result: str) -> None:
 
 def build_world_from_messages(
     messages: list[dict],
+    token_budget: int = DEFAULT_WORLD_TOKEN_BUDGET,
 ) -> tuple["WorldCache", "ProjectionControlState", list[tuple[dict, dict]]]:
     """Reconstruct (world, control, pairs) from a Claude Code message history.
 
@@ -487,9 +516,14 @@ def build_world_from_messages(
     observation except the most recent one — that final pair is returned
     separately so the caller can present it verbatim as the live stimulus
     (preserving Claude Code's real tool ids/names).
+
+    ``token_budget`` sizes the world cache. It defaults to
+    :data:`DEFAULT_WORLD_TOKEN_BUDGET` (generous, because the proxy fronts a
+    large-context model); pass a small value to emulate the old, constrained
+    behaviour (e.g. a small local model).
     """
     pairs = _extract_pairs(messages)
-    world = WorldCache(token_budget=8000)
+    world = WorldCache(token_budget=token_budget)
     control = ProjectionControlState()
 
     last_index = len(pairs) - 1
@@ -664,7 +698,8 @@ def is_worker_payload(payload: dict) -> bool:
 
 def project_payload(payload: dict, keep_tools: Optional[set] = None,
                     preserve_claude_identity: bool = False,
-                    cache_prefix: Optional[bool] = None) -> dict:
+                    cache_prefix: Optional[bool] = None,
+                    world_token_budget: Optional[int] = None) -> dict:
     """Project a Claude Code Anthropic Messages payload into constant space.
 
     Steps:
@@ -723,7 +758,11 @@ def project_payload(payload: dict, keep_tools: Optional[set] = None,
             payload["messages"] = [{"role": "user", "content": [block]}]
         return payload
 
-    world, control, pairs = build_world_from_messages(messages)
+    world, control, pairs = build_world_from_messages(
+        messages,
+        token_budget=(world_token_budget if world_token_budget is not None
+                      else DEFAULT_WORLD_TOKEN_BUDGET),
+    )
 
     last_tool_use: list = []
     last_tool_result: list = []
