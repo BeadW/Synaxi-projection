@@ -29,6 +29,7 @@ import json
 import os
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -58,11 +59,17 @@ LOG_DIR = Path(os.environ.get("SYNAXI_LOG_DIR", Path.home() / ".synaxi-projectio
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / f"session_{int(time.time())}.jsonl"
 
+# The server is thread-per-connection (see _ThreadingProxyServer), so several
+# request handlers may call _log() at once. Serialise the append so concurrent
+# turns can't interleave a half-written JSONL line.
+_LOG_LOCK = threading.Lock()
+
 
 def _log(entry):
     try:
-        with LOG_FILE.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+        line = json.dumps(entry) + "\n"
+        with _LOG_LOCK, LOG_FILE.open("a") as f:
+            f.write(line)
     except Exception:
         pass
 
@@ -433,7 +440,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(msg)
 
 
+class _ThreadingProxyServer(http.server.ThreadingHTTPServer):
+    """Thread-per-connection proxy server.
+
+    Subagents make projection concurrent. A single ``Agent(synaxi-worker)`` turn
+    puts several requests in flight at once — the worker subagent's own
+    ``/v1/messages`` calls plus Claude Code's parallel title / topic / quota
+    sidecars — and the parent may still be polling. The stock single-threaded
+    :class:`http.server.HTTPServer` serves one connection at a time and blocks
+    the whole process inside the upstream call (``timeout=600`` in
+    :meth:`ProxyHandler._forward_capture`), so the instant a subagent spawns the
+    next connection can't be accepted and Claude Code reports "Unable to connect
+    to API (ConnectionRefused)", interrupting the worker. Giving every
+    connection its own thread lets parent + subagent(s) be served simultaneously.
+
+    Re-entrancy: :func:`project_payload` builds a fresh :class:`WorldCache` per
+    call (no shared mutable state) and :func:`_log` is guarded by ``_LOG_LOCK``,
+    so the handler is thread-safe.
+    """
+
+    daemon_threads = True      # in-flight requests never block interpreter shutdown
+    request_queue_size = 128   # tolerate connection bursts (stdlib default is 5)
+
+
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("127.0.0.1", PORT), ProxyHandler)
-    print(f"synaxi-proxy on http://127.0.0.1:{PORT} -> {UPSTREAM}", flush=True)
+    server = _ThreadingProxyServer(("127.0.0.1", PORT), ProxyHandler)
+    print(f"synaxi-proxy on http://127.0.0.1:{PORT} -> {UPSTREAM} (threaded)", flush=True)
     server.serve_forever()
